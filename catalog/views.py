@@ -16,7 +16,7 @@ column but "view only" is granted table by table. See
 from datetime import date
 
 from django.db import transaction
-from django.db.models import Count
+from django.db.models import Count, Q
 from drf_spectacular.utils import OpenApiParameter, extend_schema
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
@@ -179,11 +179,29 @@ class WarehouseViewSet(viewsets.ModelViewSet):
 class SchoolViewSet(viewsets.ModelViewSet):
     """The customers. Each orders from one primary warehouse."""
 
-    queryset = School.objects.select_related("primary_warehouse").order_by("name")
     serializer_class = SchoolSerializer
     permission_classes = MASTER_DATA
     read_roles = (Role.WAREHOUSE_STAFF, Role.SCHOOL_STAFF)
-    filterset_fields = ("level", "primary_warehouse")
+    filterset_fields = ("level", "primary_warehouse", "is_active")
+
+    def get_queryset(self):
+        # Annotated, the same reason Garment's sku_count is: without it,
+        # listing schools costs one query per row rather than one query.
+        #
+        # "Active" here means not yet shipped and not cancelled — HOLD,
+        # RELEASED or PICKED. Worth confirming with AsOne: this counts what
+        # still needs *action*, not every order ever placed, which is a
+        # judgement call in the absence of a stated definition.
+        return (
+            School.objects.select_related("primary_warehouse")
+            .annotate(
+                active_orders_count=Count(
+                    "orders",
+                    filter=Q(orders__status__in=["HOLD", "RELEASED", "PICKED"]),
+                )
+            )
+            .order_by("name")
+        )
 
 
 # ---------------------------------------------------------------------------

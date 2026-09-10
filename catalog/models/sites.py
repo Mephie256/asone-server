@@ -91,6 +91,16 @@ class School(models.Model):
         Warehouse, on_delete=models.PROTECT, related_name="schools"
     )
 
+    # Same "Active Y/N" pattern as Garment and Sku. A school stops taking
+    # deliveries without erasing its order history — PROTECT on every FK
+    # pointing at it would refuse the delete anyway, so deactivating is the
+    # only real option, and now it is a supported one rather than an
+    # unsupported one somebody reaches for.
+    is_active = models.BooleanField(
+        default=True,
+        help_text="Inactive schools stay in reports and past orders but cannot be assigned new ones.",
+    )
+
     class Meta:
         ordering = ["name"]
         constraints = [
