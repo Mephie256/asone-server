@@ -151,7 +151,10 @@ class SchoolOrderViewSet(viewsets.ModelViewSet):
         User.Role.PROGRAM_LEAD,
         User.Role.OPERATIONS_MANAGER,
     )
-    filterset_fields = ("status", "order_date")
+    # `school` matters now that leads can read this list at all (see
+    # read_roles above): without it, a lead viewing one school's orders
+    # would have to page through every school's to find them.
+    filterset_fields = ("status", "order_date", "school")
     search_fields = ("number", "student_name")
     http_method_names = ["get", "post", "patch", "head", "options"]
 
