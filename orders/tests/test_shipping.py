@@ -324,3 +324,67 @@ class ShippingOverHttp(ShippingSetup):
 
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["from_warehouse_name"], "Namayemba")
+
+
+class ShipmentListEndpoint(ShippingSetup):
+    """`/api/orders/shipments/` — every shipment already created through
+    `ship`/`fill`, listable on its own for a warehouse's recent dispatch
+    history rather than reached one order at a time."""
+
+    def setUp(self):
+        super().setUp()
+        self.joan = make_user(
+            "joan", Role.WAREHOUSE_STAFF, warehouse=self.other_warehouse
+        )
+        self.lead = make_user("sharon", Role.PROGRAM_LEAD)
+
+    def url(self):
+        return reverse("orders:shipment-list")
+
+    def test_a_warehouse_clerk_sees_their_own_dispatches(self):
+        ship_order(self.picked_order(), shipped_by=self.julius, shipped_on=SHIPPED_ON)
+        self.client.force_authenticate(self.julius)
+
+        response = self.client.get(self.url())
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["count"], 1)
+        self.assertEqual(response.data["results"][0]["from_warehouse_name"], "Namayemba")
+
+    def test_a_warehouse_clerk_does_not_see_another_sites(self):
+        ship_order(self.picked_order(), shipped_by=self.julius, shipped_on=SHIPPED_ON)
+        self.client.force_authenticate(self.joan)
+
+        self.assertEqual(self.client.get(self.url()).data["count"], 0)
+
+    def test_a_lead_sees_every_site(self):
+        ship_order(self.picked_order(), shipped_by=self.julius, shipped_on=SHIPPED_ON)
+        self.client.force_authenticate(self.lead)
+
+        self.assertEqual(self.client.get(self.url()).data["count"], 1)
+
+    def test_a_lead_can_filter_to_one_warehouse(self):
+        ship_order(self.picked_order(), shipped_by=self.julius, shipped_on=SHIPPED_ON)
+        self.client.force_authenticate(self.lead)
+
+        matching = self.client.get(self.url(), {"from_warehouse": self.warehouse.id})
+        other = self.client.get(self.url(), {"from_warehouse": self.other_warehouse.id})
+
+        self.assertEqual(matching.data["count"], 1)
+        self.assertEqual(other.data["count"], 0)
+
+    def test_finance_cannot_list_shipments(self):
+        """`CanReceiveAndShip` is leads and Warehouse Staff — Finance reads
+        the costed report instead, not the operational dispatch log."""
+        self.client.force_authenticate(self.finance)
+
+        self.assertEqual(
+            self.client.get(self.url()).status_code, status.HTTP_403_FORBIDDEN
+        )
+
+    def test_a_school_clerk_cannot_list_shipments(self):
+        self.client.force_authenticate(self.clerk)
+
+        self.assertEqual(
+            self.client.get(self.url()).status_code, status.HTTP_403_FORBIDDEN
+        )

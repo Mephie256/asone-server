@@ -5,7 +5,7 @@ from rest_framework import serializers
 
 
 class DashboardSummarySerializer(serializers.Serializer):
-    """The six tiles across the top — F62."""
+    """The tiles across the top — F62, plus the warehouse hub console's own."""
 
     available_units = serializers.IntegerField(
         help_text="Units on hand and free to promise."
@@ -26,6 +26,9 @@ class DashboardSummarySerializer(serializers.Serializer):
     )
     skus_below_minimum = serializers.IntegerField(
         help_text="SKUs at or under their reorder floor."
+    )
+    units_shipped_today = serializers.IntegerField(
+        help_text="Units on shipments with today's date as shipped_on."
     )
 
 

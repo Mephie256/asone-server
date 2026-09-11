@@ -268,6 +268,39 @@ class PickedButNotDespatched(ReportSetup):
             self.client.get(reverse("orders:orders-part-processed")).data["count"], 0
         )
 
+    def test_a_lead_can_narrow_to_one_warehouse(self):
+        """`?warehouse=` — the hub console drilling into one site rather
+        than the whole country's queue at once."""
+        self.stock(self.shirt, 20)
+        pick_order(self.order(shirt=2), picked_by=self.julius)
+        self.client.force_authenticate(self.lead)
+
+        all_sites = self.client.get(reverse("orders:orders-part-processed"))
+        self.assertEqual(all_sites.data["count"], 1)
+
+        namayemba_only = self.client.get(
+            reverse("orders:orders-part-processed"), {"warehouse": self.namayemba.id}
+        )
+        self.assertEqual(namayemba_only.data["count"], 1)
+
+        serere_only = self.client.get(
+            reverse("orders:orders-part-processed"), {"warehouse": self.serere.id}
+        )
+        self.assertEqual(serere_only.data["count"], 0)
+
+    def test_warehouse_param_cannot_widen_a_clerks_own_scope(self):
+        """A site-scoped role can only narrow further, never past
+        `scope_to_user_site` — passing another site's id is not a way in."""
+        self.stock(self.shirt, 20)
+        pick_order(self.order(shirt=2), picked_by=self.julius)
+        self.client.force_authenticate(self.joan)
+
+        response = self.client.get(
+            reverse("orders:orders-part-processed"), {"warehouse": self.namayemba.id}
+        )
+
+        self.assertEqual(response.data["count"], 0)
+
 
 class TheCostedReportDoesNotDoubleCount(ReportSetup):
     """F57, and the bug this file exists to keep out.

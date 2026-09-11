@@ -25,7 +25,7 @@ from django.utils import timezone
 from catalog.models import Sku
 from inventory.models import MovementType, StockMovement, StockStatus
 from inventory.services import below_minimum, stock_levels
-from orders.models import Backorder, Shipment
+from orders.models import Backorder, Shipment, ShipmentLine
 from orders.models.backorders import BackorderStatus
 from orders.models.school_orders import OrderStatus, SchoolOrder, SchoolOrderLine
 from procurement.models import ProductionOrder, Receipt
@@ -107,6 +107,23 @@ def skus_below_minimum(warehouse=None):
     return len(below_minimum(warehouse=warehouse))
 
 
+def units_shipped_today(warehouse=None):
+    """Units that left a warehouse today — the warehouse hub console's
+    "Shipped Today" tile.
+
+    Counted from `shipped_on`, the day the van left, not `created_at` — a
+    shipment entered a day late should count against the day it actually
+    went, the same reasoning `shipments_costed()` applies with `_within()`.
+    """
+    lines = ShipmentLine.objects.filter(shipment__shipped_on=date.today())
+    if warehouse is not None:
+        lines = lines.filter(shipment__from_warehouse=warehouse)
+
+    return lines.aggregate(
+        units=Coalesce(Sum("quantity"), Value(0), output_field=IntegerField())
+    )["units"]
+
+
 def summary(warehouse=None):
     """Everything the six tiles need, in one call.
 
@@ -123,6 +140,7 @@ def summary(warehouse=None):
         "orders_awaiting_dispatch": orders_awaiting_dispatch(warehouse),
         "outstanding_backorders": outstanding_backorders(warehouse),
         "skus_below_minimum": skus_below_minimum(warehouse),
+        "units_shipped_today": units_shipped_today(warehouse),
     }
 
 
