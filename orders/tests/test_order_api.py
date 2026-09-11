@@ -136,6 +136,35 @@ class OnlySchoolStaffReachThePointOfSale(OrderApiSetup):
         self.assertEqual(self.place(user=self.finance).status_code, status.HTTP_403_FORBIDDEN)
 
 
+class ALeadCanFilterBySchool(OrderApiSetup):
+    """`?school=` — added alongside the read-access widening above.
+
+    A lead sees every school's orders unfiltered; this is what lets them ask
+    for one school's, the way the Locations screens need to.
+    """
+
+    def test_filters_to_one_school(self):
+        self.place(user=self.chrisis)
+        self.place(user=self.peter)
+
+        self.client.force_authenticate(self.lead)
+        response = self.client.get(
+            reverse("orders:school-order-list"), {"school": self.school.pk}
+        )
+
+        self.assertEqual(response.data["count"], 1)
+        self.assertEqual(response.data["results"][0]["school"], self.school.pk)
+
+    def test_unfiltered_a_lead_sees_every_school(self):
+        self.place(user=self.chrisis)
+        self.place(user=self.peter)
+
+        self.client.force_authenticate(self.lead)
+        response = self.client.get(reverse("orders:school-order-list"))
+
+        self.assertEqual(response.data["count"], 2)
+
+
 class ASchoolOrdersOnlyForItself(OrderApiSetup):
     def test_the_order_belongs_to_the_clerks_school(self):
         response = self.place()

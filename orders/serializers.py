@@ -136,6 +136,9 @@ class ShipmentSerializer(serializers.ModelSerializer):
         source="from_warehouse.name", read_only=True
     )
     order_number = serializers.CharField(source="order.number", read_only=True)
+    order_school_name = serializers.CharField(
+        source="order.school.name", read_only=True
+    )
     shipped_by_name = serializers.CharField(
         source="shipped_by.get_full_name", read_only=True
     )
@@ -148,6 +151,7 @@ class ShipmentSerializer(serializers.ModelSerializer):
             "number",
             "order",
             "order_number",
+            "order_school_name",
             "from_warehouse",
             "from_warehouse_name",
             "shipped_on",
@@ -414,13 +418,14 @@ class PartProcessedOrderSerializer(serializers.ModelSerializer):
     warehouse_name = serializers.CharField(
         source="school.primary_warehouse.name", read_only=True
     )
+    status_display = serializers.CharField(source="get_status_display", read_only=True)
     total = serializers.DecimalField(max_digits=14, decimal_places=2, read_only=True)
 
     class Meta:
         model = SchoolOrder
         fields = (
             "id", "number", "school", "school_name", "warehouse_name",
-            "student_name", "order_date", "status", "total",
+            "student_name", "order_date", "status", "status_display", "total",
         )
         read_only_fields = fields
 

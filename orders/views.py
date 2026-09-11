@@ -28,7 +28,7 @@ from accounts.permissions import (
 from catalog.services import PriceNotSet
 
 from . import reports, services
-from .models import Backorder, SchoolOrder, SchoolOrderLine
+from .models import Backorder, SchoolOrder, SchoolOrderLine, Shipment
 from .permissions import (
     CanConfirmPayment,
     CanConfirmReceipt,
@@ -151,7 +151,10 @@ class SchoolOrderViewSet(viewsets.ModelViewSet):
         User.Role.PROGRAM_LEAD,
         User.Role.OPERATIONS_MANAGER,
     )
-    filterset_fields = ("status", "order_date")
+    # `school` matters now that leads can read this list at all (see
+    # read_roles above): without it, a lead viewing one school's orders
+    # would have to page through every school's to find them.
+    filterset_fields = ("status", "order_date", "school")
     search_fields = ("number", "student_name")
     http_method_names = ["get", "post", "patch", "head", "options"]
 
@@ -818,6 +821,32 @@ class BackorderViewSet(viewsets.ReadOnlyModelViewSet):
         )
 
 
+class ShipmentViewSet(viewsets.ReadOnlyModelViewSet):
+    """What has left a warehouse — F41, read-only.
+
+    Every shipment is already created through an action elsewhere (`ship`
+    on a school order, `fill` on a backorder) — this is the resource those
+    actions leave behind, listable on its own for a warehouse's own recent
+    dispatch history rather than reached one order at a time.
+
+    Same matrix column as receiving: `CanReceiveAndShip`. Warehouse Staff see
+    their own site's despatches; the leads see every site's.
+    """
+
+    queryset = Shipment.objects.none()
+    serializer_class = ShipmentSerializer
+    permission_classes = [*AUTHENTICATED, CanReceiveAndShip]
+    filterset_fields = ("from_warehouse", "order")
+
+    def get_queryset(self):
+        queryset = Shipment.objects.select_related(
+            "order", "order__school", "from_warehouse", "shipped_by"
+        ).prefetch_related("lines__sku")
+        return scope_to_user_site(
+            queryset, self.request.user, warehouse_field="from_warehouse"
+        )
+
+
 @extend_schema(
     tags=["Orders — reports"],
     summary="Backorders outstanding",
@@ -850,6 +879,17 @@ class OutstandingBackordersView(ListAPIView):
 @extend_schema(
     tags=["Orders — reports"],
     summary="Orders picked but not despatched",
+    parameters=[
+        OpenApiParameter(
+            "warehouse",
+            int,
+            description=(
+                "Narrow to one site. Ignored for Warehouse Staff, who are "
+                "already scoped to their own; an all-locations role sees "
+                "every site without it."
+            ),
+        )
+    ],
     responses=PartProcessedOrderSerializer(many=True),
     description=(
         "F52 and F54 — orders with a pick list and no packing list.\n\n"
@@ -872,18 +912,30 @@ class PartProcessedOrdersView(ListAPIView):
     schools, F52 does not — so they share one query rather than being
     written twice and drifting apart. `scope_to_user_site` supplies the
     difference: a school clerk gets their own school's rows.
+
+    `?warehouse=` narrows further, on top of that scoping rather than
+    instead of it — the same drill-down `_WarehouseScoped` gives the
+    dashboard, for a lead looking at one warehouse's own picking queue
+    instead of every site's at once. A site-scoped role can only narrow to
+    what `scope_to_user_site` already let through, so passing someone else's
+    warehouse here returns nothing rather than widening anything.
     """
 
     serializer_class = PartProcessedOrderSerializer
     permission_classes = [*AUTHENTICATED, CanReadFulfilmentReports]
 
     def get_queryset(self):
-        return scope_to_user_site(
+        queryset = scope_to_user_site(
             reports.part_processed_orders(),
             self.request.user,
             school_field="school",
             warehouse_field="school__primary_warehouse",
         )
+
+        warehouse_id = self.request.query_params.get("warehouse")
+        if warehouse_id:
+            queryset = queryset.filter(school__primary_warehouse_id=warehouse_id)
+        return queryset
 
 
 @extend_schema(

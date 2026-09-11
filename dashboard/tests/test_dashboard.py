@@ -138,6 +138,55 @@ class TheTilesAgreeWithTheScreensTheyLinkTo(DashboardSetup):
         self.assertEqual(services.orders_awaiting_dispatch(self.namayemba), 0)
 
 
+class ShippedTodayTile(DashboardSetup):
+    """"Shipped Today" — the warehouse hub console's own tile, dated to
+    `shipped_on` (the day the van left), not `created_at`."""
+
+    def test_a_shipment_dated_today_counts(self):
+        self.stock(self.shirt, 100)
+        picked = pick_order(self.order(quantity=6), picked_by=self.julius)
+
+        ship_order(picked, shipped_by=self.julius, shipped_on=timezone.now().date())
+
+        self.assertEqual(services.units_shipped_today(self.namayemba), 6)
+
+    def test_a_shipment_dated_yesterday_does_not_count(self):
+        self.stock(self.shirt, 100)
+        picked = pick_order(self.order(quantity=6), picked_by=self.julius)
+
+        ship_order(
+            picked,
+            shipped_by=self.julius,
+            shipped_on=timezone.now().date() - timedelta(days=1),
+        )
+
+        self.assertEqual(services.units_shipped_today(self.namayemba), 0)
+
+    def test_it_is_scoped_to_one_warehouse(self):
+        self.stock(self.shirt, 100)
+        picked = pick_order(self.order(quantity=6), picked_by=self.julius)
+        ship_order(picked, shipped_by=self.julius, shipped_on=timezone.now().date())
+
+        # Serere's own dispatch, so Namayemba's tile has something real to
+        # exclude rather than just an empty warehouse.
+        self.stock(self.shirt, 100, warehouse=self.serere)
+        serere_order = pick_order(
+            place_order(
+                school=self.sites["school_b"],
+                student_name="Grace Nabirye",
+                order_date=TODAY,
+                skus=[{"sku": self.shirt, "quantity": 3}],
+                created_by=self.clerk,
+            ),
+            picked_by=self.joan,
+        )
+        ship_order(serere_order, shipped_by=self.joan, shipped_on=timezone.now().date())
+
+        self.assertEqual(services.units_shipped_today(self.namayemba), 6)
+        self.assertEqual(services.units_shipped_today(self.serere), 3)
+        self.assertEqual(services.units_shipped_today(), 9)
+
+
 class EverythingIsScopedToOneWarehouse(DashboardSetup):
     """The design has a site selector and names the site in the heading, so
     every figure is "here", never "everywhere"."""

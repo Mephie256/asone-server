@@ -50,7 +50,7 @@ class TailoringCenterSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = TailoringCenter
-        fields = ("id", "name", "address")
+        fields = ("id", "name", "address", "is_active")
 
 
 class WarehouseSerializer(serializers.ModelSerializer):
@@ -70,6 +70,7 @@ class WarehouseSerializer(serializers.ModelSerializer):
             "address",
             "primary_tailoring_center",
             "primary_tailoring_center_name",
+            "is_active",
         )
 
 
@@ -82,6 +83,10 @@ class SchoolSerializer(serializers.ModelSerializer):
     primary_warehouse_name = serializers.CharField(
         source="primary_warehouse.name", read_only=True
     )
+    # Annotated on the viewset's queryset — see SchoolViewSet.get_queryset for
+    # what "active" means here. Absent (None) on a plain `School(...)` that
+    # never went through that queryset, e.g. straight after `.create()`.
+    active_orders_count = serializers.IntegerField(read_only=True, default=None)
 
     class Meta:
         model = School
@@ -93,6 +98,8 @@ class SchoolSerializer(serializers.ModelSerializer):
             "address",
             "primary_warehouse",
             "primary_warehouse_name",
+            "is_active",
+            "active_orders_count",
         )
 
 
