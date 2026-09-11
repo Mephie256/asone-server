@@ -15,6 +15,16 @@ class TailoringCenter(models.Model):
     name = models.CharField(max_length=120)
     address = models.TextField(blank=True)
 
+    # Same "Active Y/N" pattern as Garment, Sku and School. A Tailoring
+    # Center that stops taking production orders keeps its history — every
+    # past receipt and production order still points at it, and PROTECT
+    # would refuse a delete anyway — so deactivating is the supported way
+    # to retire one.
+    is_active = models.BooleanField(
+        default=True,
+        help_text="Inactive tailoring centers stay in reports but cannot be assigned new production orders.",
+    )
+
     class Meta:
         ordering = ["name"]
         constraints = [
@@ -43,6 +53,12 @@ class Warehouse(models.Model):
     # warehouse may be set up before its Tailoring Center exists.
     primary_tailoring_center = models.ForeignKey(
         TailoringCenter, null=True, blank=True, on_delete=models.PROTECT
+    )
+
+    # Same "Active Y/N" pattern as everywhere else in this module.
+    is_active = models.BooleanField(
+        default=True,
+        help_text="Inactive warehouses stay in reports and past orders but cannot receive new stock.",
     )
 
     class Meta:

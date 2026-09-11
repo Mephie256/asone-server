@@ -161,6 +161,7 @@ class TailoringCenterViewSet(viewsets.ModelViewSet):
     serializer_class = TailoringCenterSerializer
     permission_classes = MASTER_DATA
     read_roles = (Role.WAREHOUSE_STAFF,)
+    filterset_fields = ("is_active",)
     search_fields = ("name",)
 
 
@@ -172,7 +173,7 @@ class WarehouseViewSet(viewsets.ModelViewSet):
     serializer_class = WarehouseSerializer
     permission_classes = MASTER_DATA
     read_roles = (Role.WAREHOUSE_STAFF,)
-    filterset_fields = ("primary_tailoring_center",)
+    filterset_fields = ("primary_tailoring_center", "is_active")
 
 
 @extend_schema(tags=["Master data — sites"])

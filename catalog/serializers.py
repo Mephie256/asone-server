@@ -50,7 +50,7 @@ class TailoringCenterSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = TailoringCenter
-        fields = ("id", "name", "address")
+        fields = ("id", "name", "address", "is_active")
 
 
 class WarehouseSerializer(serializers.ModelSerializer):
@@ -70,6 +70,7 @@ class WarehouseSerializer(serializers.ModelSerializer):
             "address",
             "primary_tailoring_center",
             "primary_tailoring_center_name",
+            "is_active",
         )
 
 
