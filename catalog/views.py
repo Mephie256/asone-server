@@ -167,12 +167,23 @@ class TailoringCenterViewSet(viewsets.ModelViewSet):
 
 @extend_schema(tags=["Master data — sites"])
 class WarehouseViewSet(viewsets.ModelViewSet):
-    """Where finished stock is held."""
+    """Where finished stock is held.
+
+    Finance reads this, which the matrix's "Warehouses — view: Warehouse
+    Staff" line does not say on its face. It follows from two cells that do:
+    Finance's scope is *all locations*, and F23 gives them adjustments at
+    *all sites*. An adjustment names the warehouse it is posted at, so a role
+    that cannot list warehouses cannot post one — the picker on the New
+    Adjustment screen came up empty and there was no way to choose a site.
+
+    Read only, as for everybody outside the leads. Editing a warehouse is
+    still the Table Updates column.
+    """
 
     queryset = Warehouse.objects.select_related("primary_tailoring_center").order_by("name")
     serializer_class = WarehouseSerializer
     permission_classes = MASTER_DATA
-    read_roles = (Role.WAREHOUSE_STAFF,)
+    read_roles = (Role.WAREHOUSE_STAFF, Role.FINANCE)
     filterset_fields = ("primary_tailoring_center", "is_active")
 
 
