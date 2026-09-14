@@ -19,7 +19,9 @@ urlpatterns = [
     path("picking/queue/", views.PickingQueueView.as_view(), name="picking-queue"),
     # F43, F44 — orders held because their warehouse is short.
     path(
-        "orders/awaiting-stock/",
+        # Not "school-orders/awaiting-stock/": the router's detail route
+        # is school-orders/<pk>/ and would swallow it.
+        "awaiting-stock/",
         views.OrdersAwaitingStockView.as_view(),
         name="orders-awaiting-stock",
     ),
