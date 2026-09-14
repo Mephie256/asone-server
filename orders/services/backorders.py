@@ -275,3 +275,73 @@ def fill_backorder(backorder, *, filled_by, shipped_on=None, waybill_number="", 
     backorder.status = BackorderStatus.FILLED
     backorder.save(update_fields=["status"])
     return shipment
+
+
+def eligible_for_release(warehouse=None):
+    """Open backorders some warehouse could fill today — F45's shortlist.
+
+    The "Release All Eligible" queue. An OPEN backorder nobody can fill is a
+    waiting game; one where stock has since arrived somewhere is a job
+    somebody could do this afternoon and has not noticed.
+
+    Checks **every** warehouse, not just the school's own: decision D2 lets
+    another warehouse ship direct, so stock at Serere can fill a Namayemba
+    shortfall. `warehouse` narrows to backorders *raised by* that site,
+    which is what its own staff are chasing — not where the stock is.
+    """
+    queryset = Backorder.objects.filter(status=BackorderStatus.OPEN).select_related(
+        "order", "order__school", "order__school__primary_warehouse", "sku"
+    )
+    if warehouse is not None:
+        queryset = queryset.filter(order__school__primary_warehouse=warehouse)
+
+    return [
+        backorder
+        for backorder in queryset
+        if warehouses_that_could_fill(backorder)
+    ]
+
+
+@transaction.atomic
+def release_eligible(*, released_by, warehouse=None, backorders=None):
+    """Assign and ship every backorder that can go — the bulk action.
+
+    Each one is assigned to the warehouse holding the most of that SKU and
+    shipped direct to the school, which is what `assign` then `fill` do one
+    at a time. Doing it in bulk changes nothing about either: the same
+    checks run per backorder, and the same ledger rows are written.
+
+    **All or nothing.** One transaction, so a backorder that cannot be
+    filled halfway through does not leave half the queue released and the
+    rest untouched — a clerk who pressed one button should get one outcome.
+
+    Returns the shipments created, which is what the confirmation screen
+    reports back.
+    """
+    from inventory.services import stock_level
+
+    if backorders is None:
+        backorders = eligible_for_release(warehouse)
+    else:
+        backorders = list(backorders)
+
+    if not backorders:
+        raise NoStockToFill("No backorder is currently fillable.")
+
+    shipments = []
+    for backorder in backorders:
+        options = warehouses_that_could_fill(backorder)
+        if not options:
+            raise NoStockToFill(
+                f"{backorder.order.number} / {backorder.sku.number} cannot be "
+                "filled from anywhere."
+            )
+
+        # The warehouse holding the most, so one release does not strip a
+        # site that is only just covering its own orders.
+        best = max(options, key=lambda w: stock_level(backorder.sku, w))
+
+        assign_backorder(backorder, warehouse=best, assigned_by=released_by)
+        shipments.append(fill_backorder(backorder, filled_by=released_by))
+
+    return shipments

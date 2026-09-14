@@ -44,6 +44,7 @@ from .permissions import (
 from .serializers import (
     AssignBackorderSerializer,
     PickingQueueRowSerializer,
+    ReleaseEligibleSerializer,
     PickingQueueSerializer,
     PickingSummarySerializer,
     DespatchSerializer,
@@ -817,6 +818,65 @@ class BackorderViewSet(viewsets.ReadOnlyModelViewSet):
 
         backorder.refresh_from_db()
         return Response(BackorderSerializer(backorder).data)
+
+    @extend_schema(
+        summary="Backorders that could be filled today",
+        responses=BackorderSerializer(many=True),
+        description=(
+            "Open backorders some warehouse is holding stock for — the queue "
+            "behind Release All Eligible.\n\n"
+            "Checks **every** warehouse, not just the school's own: decision "
+            "D2 lets another warehouse ship direct, so stock at Serere can "
+            "fill a Namayemba shortfall."
+        ),
+    )
+    @action(detail=False, methods=["get"], url_path="eligible")
+    def eligible(self, request):
+        rows = services.eligible_for_release(request.user.warehouse)
+        return Response(BackorderSerializer(rows, many=True).data)
+
+    @extend_schema(
+        summary="Release every eligible backorder",
+        request=ReleaseEligibleSerializer,
+        responses={201: ShipmentSerializer(many=True)},
+        description=(
+            "Assigns each backorder to the warehouse holding the most of "
+            "that SKU and ships it direct to the school — the same two steps "
+            "as `assign` then `fill`, done together.\n\n"
+            "**All or nothing.** One transaction, so a backorder that cannot "
+            "be filled halfway through does not leave half the queue "
+            "released: a clerk who pressed one button gets one outcome."
+        ),
+    )
+    @action(detail=False, methods=["post"], url_path="release-eligible")
+    def release_eligible(self, request):
+        chosen = ReleaseEligibleSerializer(data=request.data)
+        chosen.is_valid(raise_exception=True)
+        ids = chosen.validated_data.get("backorders")
+
+        queryset = self.get_queryset()
+        picked = list(queryset.filter(pk__in=ids)) if ids else None
+
+        if ids and len(picked) != len(set(ids)):
+            raise DRFValidationError(
+                {"backorders": "Some of those are not yours, or do not exist."}
+            )
+
+        try:
+            shipments = services.release_eligible(
+                released_by=request.user,
+                warehouse=request.user.warehouse,
+                backorders=picked,
+            )
+        except services.NoStockToFill as exc:
+            raise DRFValidationError({"backorders": str(exc)}) from exc
+        except services.CannotAssign as exc:
+            raise DRFValidationError({"status": str(exc)}) from exc
+
+        return Response(
+            ShipmentSerializer(shipments, many=True).data,
+            status=status.HTTP_201_CREATED,
+        )
 
     @extend_schema(
         summary="Ship it direct to the school",

@@ -368,6 +368,18 @@ class BackorderSerializer(serializers.ModelSerializer):
     """What a school is still owed — F44."""
 
     order_number = serializers.CharField(source="order.number", read_only=True)
+    # The warehouse's own picking hint, carried through from the order so the
+    # exceptions queue can be worked most-urgent-first like the backlog.
+    priority = serializers.CharField(source="order.priority", read_only=True)
+    priority_display = serializers.CharField(
+        source="order.get_priority_display", read_only=True
+    )
+    # Free stock for this SKU **anywhere**, and the best single warehouse.
+    # Anywhere, because decision D2 lets another warehouse ship direct — a
+    # backorder is fillable if the goods exist somewhere, not only at the
+    # school's own site.
+    available = serializers.SerializerMethodField()
+    fillable_at = serializers.SerializerMethodField()
     school_name = serializers.CharField(source="order.school.name", read_only=True)
     student_name = serializers.CharField(source="order.student_name", read_only=True)
     sku_number = serializers.CharField(source="sku.number", read_only=True)
@@ -378,6 +390,40 @@ class BackorderSerializer(serializers.ModelSerializer):
         read_only=True,
         help_text="The warehouse that ran short.",
     )
+    def _stock(self, backorder):
+        """Free stock for this SKU, per warehouse, best first.
+
+        Cached on the instance because both computed fields want it and a
+        list of thirty backorders should not ask twice per row.
+        """
+        cached = getattr(backorder, "_free_stock", None)
+        if cached is None:
+            from inventory.services import stock_levels
+
+            cached = sorted(
+                (
+                    (row["warehouse__name"], row["level"])
+                    for row in stock_levels()
+                    if row["sku_id"] == backorder.sku_id and row["level"] > 0
+                ),
+                key=lambda pair: -pair[1],
+            )
+            backorder._free_stock = cached
+        return cached
+
+    def get_available(self, backorder) -> int:
+        """Units on hand anywhere. Zero means nobody can fill it yet."""
+        return sum(level for _, level in self._stock(backorder))
+
+    def get_fillable_at(self, backorder) -> str | None:
+        """The warehouse holding the most of it, or None.
+
+        Named rather than just counted, because the clerk's next question
+        after "can this go?" is "from where?".
+        """
+        rows = self._stock(backorder)
+        return rows[0][0] if rows else None
+
     filled_by_warehouse_name = serializers.CharField(
         source="filled_by_warehouse.name", read_only=True, default=None
     )
@@ -388,6 +434,10 @@ class BackorderSerializer(serializers.ModelSerializer):
             "id", "order", "order_number", "school_name", "student_name",
             "sku", "sku_number", "sku_description", "quantity",
             "status", "status_display",
+            "priority",
+            "priority_display",
+            "available",
+            "fillable_at",
             "origin_warehouse_name",
             "filled_by_warehouse", "filled_by_warehouse_name",
             "assigned_at", "created_at", "notes",
@@ -594,3 +644,13 @@ class PickingQueueSerializer(serializers.Serializer):
 
     summary = PickingSummarySerializer()
     orders = PaginatedPickingQueueSerializer()
+
+
+class ReleaseEligibleSerializer(serializers.Serializer):
+    """Releasing every backorder that can go — the bulk action."""
+
+    backorders = serializers.ListField(
+        child=serializers.IntegerField(),
+        required=False,
+        help_text="Which to release. Omit to release everything eligible.",
+    )
