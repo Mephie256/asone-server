@@ -1309,6 +1309,74 @@ class DespatchView(APIView):
 
 
 @extend_schema(tags=["Orders — fulfilment"])
+class OrdersAwaitingStockView(APIView):
+    """Released orders their warehouse cannot fill — F43, F44.
+
+    The queue page 8 of the pack describes: "orders held until enough
+    inventory is received to release a picklist", "released in a FIFO
+    sequence". Oldest first, because that is what FIFO means here — the
+    sequence the schools placed them in, not the sequence somebody opened
+    them in.
+
+    Each row carries what it is waiting on, so the screen can say *why* an
+    order is stuck rather than only that it is. A clerk looking at this is
+    deciding whether to wait for the next delivery or transfer the order,
+    and they cannot decide that without seeing the shortfall.
+    """
+
+    permission_classes = [*AUTHENTICATED, CanReceiveAndShip]
+
+    @extend_schema(
+        summary="Orders waiting for stock",
+        responses={200: OpenApiTypes.OBJECT},
+        parameters=[
+            OpenApiParameter(
+                "warehouse",
+                OpenApiTypes.INT,
+                description="Required for an all-locations role; ignored for a clerk.",
+            ),
+        ],
+        description=(
+            "F43 and F44 — the held-order queue, oldest first.\n\n"
+            "An order appears here when it has been paid for and its "
+            "warehouse cannot fill **every** line. Under the pack's rule "
+            "(p.8) nothing part-ships, so a single short line holds the "
+            "whole order.\n\n"
+            "It leaves the queue by one of two routes: stock arrives and it "
+            "can be picked, or it is transferred to a warehouse that has "
+            "the stock — `school-orders/{id}/transfer/`.\n\n"
+            "Derived on read, not a stored list. There is no backorder "
+            "record to create, resolve or clean up."
+        ),
+    )
+    def get(self, request):
+        warehouse = request.user.warehouse
+        if warehouse is None:
+            requested = request.query_params.get("warehouse")
+            warehouse = (
+                get_object_or_404(Warehouse, pk=requested) if requested else None
+            )
+
+        return Response(
+            [
+                {
+                    "order": SchoolOrderSerializer(entry["order"]).data,
+                    "waiting_on": [
+                        {
+                            "sku": row["sku"].number,
+                            "description": row["sku"].description,
+                            "needed": row["needed"],
+                            "available": row["available"],
+                            "shortfall": row["shortfall"],
+                        }
+                        for row in entry["shortfalls"]
+                    ],
+                }
+                for entry in services.orders_awaiting_stock(warehouse)
+            ]
+        )
+
+
 class PickingQueueView(APIView):
     """What the warehouse has to pull off the shelves — F38.
 

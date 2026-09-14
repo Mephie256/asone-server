@@ -414,3 +414,49 @@ class TheTransferEndpoints(TransferSetup):
 
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertIn("needs 5", response.data["detail"])
+
+
+class TheAwaitingStockEndpoint(TransferSetup):
+    """F43, F44 over HTTP."""
+
+    def url(self):
+        return reverse("orders:orders-awaiting-stock")
+
+    def test_a_clerk_sees_their_held_orders_and_what_they_wait_on(self):
+        order = self.held_order()
+
+        self.client.force_authenticate(self.julius)
+        response = self.client.get(self.url())
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]["order"]["number"], order.number)
+        self.assertEqual(response.data[0]["waiting_on"][0]["shortfall"], 5)
+
+    def test_another_warehouse_sees_nothing(self):
+        self.held_order()
+
+        self.client.force_authenticate(self.joan)
+        response = self.client.get(self.url())
+
+        self.assertEqual(response.data, [])
+
+    def test_a_transferred_order_moves_to_the_new_warehouses_queue(self):
+        """It should leave Namayemba's queue entirely — Serere can fill it,
+        so it is nobody's backlog any more."""
+        order = self.held_order()
+        transfer_order(order, warehouse=self.serere, transferred_by=self.julius)
+
+        self.client.force_authenticate(self.julius)
+        self.assertEqual(self.client.get(self.url()).data, [])
+
+        self.client.force_authenticate(self.joan)
+        self.assertEqual(self.client.get(self.url()).data, [])
+
+    def test_a_school_user_is_refused(self):
+        self.held_order()
+
+        self.client.force_authenticate(self.chrisis)
+        response = self.client.get(self.url())
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
