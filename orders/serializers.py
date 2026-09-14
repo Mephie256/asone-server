@@ -264,6 +264,13 @@ class SchoolOrderSerializer(serializers.ModelSerializer):
     lines = SchoolOrderLineSerializer(many=True, read_only=True)
     school_name = serializers.CharField(source="school.name", read_only=True)
     warehouse_name = serializers.CharField(source="warehouse.name", read_only=True)
+    # Null unless the order was transferred — F45. `warehouse_name` above
+    # already says who is filling it, but not *why* it is not the school's own
+    # warehouse, and that is the thing a reader needs explaining when a
+    # Namayemba school's order is being packed at Serere.
+    transferred_to_name = serializers.CharField(
+        source="fulfilled_by_warehouse.name", read_only=True, default=None
+    )
     status_display = serializers.CharField(source="get_status_display", read_only=True)
     created_by_name = serializers.CharField(
         source="created_by.get_full_name", read_only=True
@@ -278,6 +285,7 @@ class SchoolOrderSerializer(serializers.ModelSerializer):
             "school",
             "school_name",
             "warehouse_name",
+            "transferred_to_name",
             "student_name",
             "order_date",
             "status",
@@ -600,8 +608,12 @@ class PickingQueueRowSerializer(serializers.ModelSerializer):
     """An order waiting to be picked — the backlog row."""
 
     school_name = serializers.CharField(source="school.name", read_only=True)
-    warehouse_name = serializers.CharField(
-        source="school.primary_warehouse.name", read_only=True
+    # `warehouse`, not `school.primary_warehouse`. After an F45 transfer they
+    # are different warehouses, and the one that matters on a picking backlog
+    # is the one that has to pick it.
+    warehouse_name = serializers.CharField(source="warehouse.name", read_only=True)
+    transferred_to_name = serializers.CharField(
+        source="fulfilled_by_warehouse.name", read_only=True, default=None
     )
     status_display = serializers.CharField(source="get_status_display", read_only=True)
     priority_display = serializers.CharField(
@@ -618,6 +630,7 @@ class PickingQueueRowSerializer(serializers.ModelSerializer):
             "school",
             "school_name",
             "warehouse_name",
+            "transferred_to_name",
             "student_name",
             "order_date",
             "status",
