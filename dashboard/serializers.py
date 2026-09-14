@@ -41,7 +41,8 @@ class AttentionAlertSerializer(serializers.Serializer):
 
     kind = serializers.CharField(
         help_text="Stable identifier for the frontend to route on: "
-        "low_stock, orders_on_hold, receipts_unreconciled, backorders_fillable."
+        "low_stock, orders_on_hold, receipts_unreconciled, backorders_fillable, "
+        "registrations_pending."
     )
     level = serializers.CharField(help_text="CRITICAL, HOLD, INSPECTION or READY.")
     count = serializers.IntegerField()

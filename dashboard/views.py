@@ -152,7 +152,7 @@ class SummaryView(_WarehouseScoped):
 )
 class AttentionView(_WarehouseScoped):
     def get(self, request):
-        rows = services.needs_attention(self.warehouse_for(request))
+        rows = services.needs_attention(self.warehouse_for(request), user=request.user)
         return Response(AttentionAlertSerializer(rows, many=True).data)
 
 

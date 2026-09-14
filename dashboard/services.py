@@ -22,6 +22,8 @@ from django.db.models import Count, DecimalField, F, IntegerField, Sum, Value
 from django.db.models.functions import Coalesce
 from django.utils import timezone
 
+from accounts.models import RegistrationRequest
+from accounts.permissions import ALL_SITE_ROLES, has_role
 from catalog.models import Sku
 from inventory.models import MovementType, StockMovement, StockStatus
 from inventory.services import below_minimum, stock_levels
@@ -208,8 +210,8 @@ def backorders_ready_to_fill(warehouse=None):
     ]
 
 
-def needs_attention(warehouse=None):
-    """The alert list — four kinds of thing somebody should look at.
+def needs_attention(warehouse=None, user=None):
+    """The alert list — the things somebody should look at.
 
     Each row is a count and a sentence, not a list: the design shows one line
     per kind with a chip, and the row links through to the screen that has
@@ -218,6 +220,12 @@ def needs_attention(warehouse=None):
 
     Rows with a count of zero are omitted. An empty list means there is
     genuinely nothing to do, which is worth being able to say.
+
+    ``user`` is needed for the rows that are not about a site at all. A
+    pending registration belongs to whoever administers accounts, not to a
+    warehouse, so it cannot be selected by `warehouse` the way the rest are.
+    Omitted when no user is passed, which keeps every existing caller — and
+    every test — behaving exactly as before.
     """
     alerts = []
 
@@ -232,6 +240,11 @@ def needs_attention(warehouse=None):
             }
         )
 
+    # HOLD means "awaiting payment" — see OrderStatus. This row said
+    # "waiting for stock", which is a different queue entirely and now a real
+    # one (F43, orders_awaiting_stock). A warehouse user reading the old
+    # wording went looking for goods to receive when what was actually
+    # waiting was a parent paying an invoice.
     on_hold = _orders_for(warehouse).filter(status=OrderStatus.HOLD).count()
     if on_hold:
         alerts.append(
@@ -239,9 +252,40 @@ def needs_attention(warehouse=None):
                 "kind": "orders_on_hold",
                 "level": HOLD,
                 "count": on_hold,
-                "message": f"{on_hold} school orders waiting for stock",
+                "message": (
+                    f"{on_hold} school orders waiting for payment"
+                    if on_hold != 1
+                    else "1 school order waiting for payment"
+                ),
             }
         )
+
+    # Somebody asked for an account and is waiting on a human. Only the
+    # roles that can actually approve one are shown it — a row nobody can
+    # act on is noise, and this is the list people are meant to trust.
+    #
+    # Unverified requests are excluded: a lead cannot approve a request whose
+    # email address nobody has proved they hold, so surfacing one would
+    # present work that cannot be done. It appears the moment they enter
+    # their code.
+    if user is not None and has_role(user, *ALL_SITE_ROLES):
+        pending = RegistrationRequest.objects.filter(
+            status=RegistrationRequest.Status.PENDING,
+            verified_at__isnull=False,
+        ).count()
+        if pending:
+            alerts.append(
+                {
+                    "kind": "registrations_pending",
+                    "level": HOLD,
+                    "count": pending,
+                    "message": (
+                        f"{pending} people waiting for an account"
+                        if pending != 1
+                        else "1 person waiting for an account"
+                    ),
+                }
+            )
 
     unreconciled = len(receipts_needing_reconciliation(warehouse))
     if unreconciled:
