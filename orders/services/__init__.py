@@ -31,8 +31,12 @@ from .backorders import (
     release_eligible,
     eligible_for_release,
     open_backorders,
+    orders_awaiting_stock,
     pick_available,
     warehouses_that_could_fill,
+    warehouses_that_could_fill_order,
+    OrderNotTransferable,
+    transfer_order,
 )
 from .shipping import (
     CannotConfirmReceipt,
@@ -97,6 +101,10 @@ __all__ = [
     "packing_list_for",
     "pick_available",
     "warehouses_that_could_fill",
+    "warehouses_that_could_fill_order",
+    "orders_awaiting_stock",
+    "OrderNotTransferable",
+    "transfer_order",
     "picked_stock_for",
     "place_order",
     "release_order",

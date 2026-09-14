@@ -7,6 +7,7 @@ school's orders and can only create orders for that school.
 """
 
 from django.db.models import Prefetch
+from django.db.models.functions import Coalesce
 from django.shortcuts import get_object_or_404
 from drf_spectacular.types import OpenApiTypes
 from drf_spectacular.utils import OpenApiParameter, extend_schema
@@ -43,6 +44,7 @@ from .permissions import (
 )
 from .serializers import (
     AssignBackorderSerializer,
+    TransferOrderSerializer,
     PickingQueueRowSerializer,
     ReleaseEligibleSerializer,
     PickingQueueSerializer,
@@ -113,6 +115,11 @@ _PAYMENT_ACTIONS = frozenset({"release"})
 #: Its own class is also where Q7 lands if schools cannot get online.
 _RECEIPT_ACTIONS = frozenset({"confirm_receipt"})
 
+#: F45. Not Warehouse Receiving: D5 gives Warehouse Staff a Backorder
+#: Transfers capability of its own, and it is the one thing a warehouse user
+#: does that reaches past their own site. Its own column, its own class.
+_TRANSFER_ACTIONS = frozenset({"transfer", "transfer_candidates"})
+
 
 @extend_schema(tags=["Orders — point of sale"])
 class SchoolOrderViewSet(viewsets.ModelViewSet):
@@ -173,6 +180,8 @@ class SchoolOrderViewSet(viewsets.ModelViewSet):
             return [permission() for permission in [*AUTHENTICATED, CanConfirmPayment]]
         if self.action in _RECEIPT_ACTIONS:
             return [permission() for permission in [*AUTHENTICATED, CanConfirmReceipt]]
+        if self.action in _TRANSFER_ACTIONS:
+            return [permission() for permission in [*AUTHENTICATED, CanTransferBackorders]]
         if self.action == "packing_lists":
             # F40 leaves the School Staff cell blank — see CanReadPackingList,
             # which explains why that is worth querying with AsOne.
@@ -194,11 +203,24 @@ class SchoolOrderViewSet(viewsets.ModelViewSet):
         # warehouse_field for Warehouse Staff reaching availability/
         # pick_list/pick — without both, a warehouse clerk's requests would
         # pass CanReceiveAndShip and then find an empty queryset.
+        #
+        # The warehouse path is the *effective* one, not the school's own.
+        # After an F45 transfer those differ, and D2 is explicit that the
+        # warehouse doing the filling must see what it is filling —
+        # including for a school that is not "theirs". Scoping on
+        # school__primary_warehouse would hide the order from the warehouse
+        # that had just accepted it, and keep showing it to the one that
+        # gave it away.
+        queryset = queryset.annotate(
+            effective_warehouse=Coalesce(
+                "fulfilled_by_warehouse", "school__primary_warehouse"
+            )
+        )
         return scope_to_user_site(
             queryset,
             self.request.user,
             school_field="school",
-            warehouse_field="school__primary_warehouse",
+            warehouse_field="effective_warehouse",
         )
 
     def get_serializer_class(self):
@@ -340,6 +362,71 @@ class SchoolOrderViewSet(viewsets.ModelViewSet):
         except services.OrderCannotBePicked as exc:
             raise DRFValidationError({"detail": str(exc)}) from exc
         except services.OrderNotFillable as exc:
+            raise DRFValidationError({"detail": str(exc)}) from exc
+
+        order.refresh_from_db()
+        return Response(SchoolOrderSerializer(order).data)
+
+    @extend_schema(
+        summary="Warehouses that could fill this order",
+        responses={200: OpenApiTypes.OBJECT},
+        description=(
+            "F45's shortlist — which warehouses hold enough of **every** "
+            "line to finish the order.\n\n"
+            "Every line, not some. Under the pack's hold-complete rule "
+            "(p.8) a transfer is only worth making to a warehouse that can "
+            "finish the job; offering one that would itself come up short "
+            "just moves the waiting somewhere else.\n\n"
+            "The warehouse currently responsible is excluded. A clerk "
+            "cannot see another site's shelves, so asking them to guess is "
+            "how an order gets sent somewhere empty."
+        ),
+    )
+    @action(detail=True, methods=["get"], url_path="transfer-candidates")
+    def transfer_candidates(self, request, pk=None):
+        order = self.get_object()
+        return Response(
+            [
+                {"id": warehouse.pk, "name": warehouse.name}
+                for warehouse in services.warehouses_that_could_fill_order(order)
+            ]
+        )
+
+    @extend_schema(
+        summary="Transfer the order to a warehouse with stock",
+        request=TransferOrderSerializer,
+        responses={200: SchoolOrderSerializer},
+        description=(
+            "F45 — p.8's \"option to transfer an order to another warehouse "
+            "with Inventory\", and decision D2.\n\n"
+            "**Nothing moves in the ledger.** No stock is reserved at "
+            "either end; the receiving warehouse picks in the ordinary way "
+            "afterwards and that pick is what touches inventory. What "
+            "changes here is who is responsible.\n\n"
+            "The school keeps its primary warehouse — D2 is two rules and "
+            "this is only the fulfilment one. Future orders are unaffected."
+            "\n\nRefused if the target cannot fill every line, if it is "
+            "already the one filling it, or if the order has been picked: "
+            "stock is reserved by then, and re-pointing the order would "
+            "strand that reservation."
+        ),
+    )
+    @action(detail=True, methods=["post"])
+    def transfer(self, request, pk=None):
+        order = self.get_object()
+        serializer = TransferOrderSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        try:
+            services.transfer_order(
+                order,
+                warehouse=serializer.validated_data["warehouse"],
+                transferred_by=request.user,
+                reason=serializer.validated_data.get("reason", ""),
+            )
+        except services.OrderNotTransferable as exc:
+            raise DRFValidationError({"detail": str(exc)}) from exc
+        except services.NoStockToFill as exc:
             raise DRFValidationError({"detail": str(exc)}) from exc
 
         order.refresh_from_db()

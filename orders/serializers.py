@@ -454,6 +454,32 @@ class AssignBackorderSerializer(serializers.Serializer):
     )
 
 
+class TransferOrderSerializer(serializers.Serializer):
+    """Moving a whole held order to a warehouse with stock — F45.
+
+    The whole-order counterpart to AssignBackorderSerializer. Which of the
+    two is the live path depends on how AsOne answer part-shipping: under
+    the pack's hold-complete rule (p.8) an order short of stock is held
+    entire, so there are no per-SKU rows to assign and the order itself is
+    what moves.
+    """
+
+    warehouse = serializers.PrimaryKeyRelatedField(
+        queryset=Warehouse.objects.all(),
+        help_text=(
+            "A warehouse holding enough of every line to finish the order. "
+            "Get the list from `transfer-candidates/`."
+        ),
+    )
+    reason = serializers.CharField(
+        max_length=200,
+        required=False,
+        allow_blank=True,
+        default="",
+        help_text="Why it moved. A transfer is somebody's judgement, so it is worth recording who decided and why.",
+    )
+
+
 class FillBackorderSerializer(serializers.Serializer):
     """The assigned warehouse shipping direct to the school — F46."""
 

@@ -15,6 +15,23 @@ school's primary warehouse. **Fulfilment** may come from anywhere with stock,
 and goes straight to the school — it does not route back through the school's
 own warehouse first.
 
+## What a backorder *is*, under the pack's rule
+
+Page 8 settles it:
+
+> 1. Orders held until enough inventory is received to release a picklist
+> 2. Orders released in a FIFO sequence
+> 3. Option to transfer an order to another warehouse with Inventory
+
+So an order short of stock is **held whole**. Nothing ships, and no pick
+list is generated. Nobody *creates* a backorder: it is the state a released
+order falls into when its warehouse cannot fill it, and it clears when stock
+arrives or the order moves to a warehouse that has it.
+
+That is why `orders_awaiting_stock()` is a query and not a table. The
+per-SKU `Backorder` row below belongs to the other reading — part-filling —
+and is only ever written by `pick_available()`.
+
 ## Why picking short is opt-in
 
 `pick_order()` has always refused an order it cannot fill completely, and
@@ -345,3 +362,139 @@ def release_eligible(*, released_by, warehouse=None, backorders=None):
         shipments.append(fill_backorder(backorder, filled_by=released_by))
 
     return shipments
+
+
+# ---------------------------------------------------------------------------
+# The whole order moves — F43, F44, F45 under the pack's hold-complete rule
+#
+# The three functions below are the p.8 flow: see what is waiting, see who
+# could fill it, hand it over. They work on the *order*, because under
+# hold-complete there are no per-SKU shortfall rows to work on — the order
+# itself is the thing that is short.
+# ---------------------------------------------------------------------------
+
+
+class OrderNotTransferable(Exception):
+    """The order is in a state where moving it would mean something wrong."""
+
+
+def orders_awaiting_stock(warehouse=None):
+    """Released orders their warehouse cannot fill — F43, in FIFO order.
+
+    The queue AsOne's p.8 describes: "orders held until enough inventory is
+    received", "released in a FIFO sequence". Ordered by when the school
+    placed them, so the sequence is the one the pack asks for and not the
+    order somebody happened to look at them in.
+
+    Each entry is ``{"order": ..., "shortfalls": [...]}`` — the rows from
+    `check_availability()` that are actually short, so a screen can say
+    *what* it is waiting on rather than only that it is waiting.
+
+    ``warehouse`` narrows to orders that warehouse is responsible for,
+    which after a transfer is not the same set as the schools it serves.
+
+    Derived, not stored. A held order has no life of its own to record: it
+    is simply a released order that cannot be picked yet, and the moment
+    stock arrives it stops being one. Storing that would mean keeping a row
+    in step with a number it does not own.
+    """
+    from ..models import SchoolOrder
+
+    queryset = (
+        SchoolOrder.objects.filter(status=OrderStatus.RELEASED)
+        .select_related("school", "school__primary_warehouse", "fulfilled_by_warehouse")
+        .order_by("created_at", "number")
+    )
+
+    waiting = []
+    for order in queryset:
+        if warehouse is not None and order.warehouse != warehouse:
+            continue
+        short = [row for row in check_availability(order) if row["shortfall"] > 0]
+        if short:
+            waiting.append({"order": order, "shortfalls": short})
+    return waiting
+
+
+def warehouses_that_could_fill_order(order):
+    """Which warehouses hold enough for **every line** — F45's shortlist.
+
+    Every line, not some: under hold-complete a transfer is only worth
+    making to a warehouse that can finish the job. Offering one that would
+    itself come up short just moves the waiting somewhere else.
+
+    Excludes the warehouse currently responsible — see `transfer_order()`.
+    """
+    from catalog.models import Warehouse
+
+    current = order.warehouse
+    return [
+        warehouse
+        for warehouse in Warehouse.objects.exclude(pk=current.pk)
+        if not any(row["shortfall"] > 0 for row in check_availability(order, warehouse))
+    ]
+
+
+@transaction.atomic
+def transfer_order(order, *, warehouse, transferred_by, reason=""):
+    """Hand a held order to a warehouse that has the stock — F45.
+
+    p.8's third backorder option, and the whole-order reading of D2. The
+    school keeps its primary warehouse; what changes is who fills this one
+    order, and the receiving warehouse ships straight to the school.
+
+    Nothing moves in the ledger. No stock is reserved at either end — the
+    receiving warehouse picks in the ordinary way afterwards, and that pick
+    is what touches inventory. What changes here is responsibility.
+
+    Refused unless the target can fill every line, so a transfer cannot
+    leave an order waiting in a second place.
+    """
+    if order.status == OrderStatus.CANCELLED:
+        raise OrderNotTransferable(f"{order.number} is cancelled.")
+
+    if order.status in (OrderStatus.PICKED, OrderStatus.SHIPPED, OrderStatus.COMPLETED):
+        # Stock is already reserved or gone at the current warehouse.
+        # Re-pointing the order would strand that reservation with nothing
+        # referring to it, and the ledger would still say it is held for a
+        # pick nobody is going to make.
+        raise OrderNotTransferable(
+            f"{order.number} has already been picked. Stock is reserved at "
+            f"{order.warehouse.name}; release it there before moving the order."
+        )
+
+    if order.status == OrderStatus.HOLD:
+        raise OrderNotTransferable(
+            f"{order.number} has not been paid for. An order is only "
+            "transferred because a warehouse cannot fill it, and nobody has "
+            "tried to fill this one yet."
+        )
+
+    if warehouse == order.warehouse:
+        raise OrderNotTransferable(
+            f"{warehouse.name} is already filling {order.number}."
+        )
+
+    short = [row for row in check_availability(order, warehouse) if row["shortfall"] > 0]
+    if short:
+        listed = ", ".join(
+            f"{row['sku'].number} (needs {row['needed']}, has {row['available']})"
+            for row in short
+        )
+        raise NoStockToFill(
+            f"{warehouse.name} cannot fill {order.number} either: {listed}."
+        )
+
+    order.fulfilled_by_warehouse = warehouse
+    order.transferred_at = timezone.now()
+    order.transferred_by = transferred_by
+    order.transfer_reason = reason.strip()
+    order.save(
+        update_fields=[
+            "fulfilled_by_warehouse",
+            "transferred_at",
+            "transferred_by",
+            "transfer_reason",
+        ]
+    )
+    return order
