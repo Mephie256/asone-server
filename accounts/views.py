@@ -729,17 +729,12 @@ class RegistrationRequestCreateView(APIView):
         serializer = RegistrationRequestCreateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
-        try:
-            with transaction.atomic():
-                registration = services.request_registration(
-                    **serializer.validated_data, http_request=request
-                )
-        except OSError as exc:
-            raise ServiceUnavailable(
-                "The request was not saved because the confirmation email "
-                "could not be sent. Nothing has been saved — try again, and "
-                "tell whoever runs the system if it keeps happening."
-            ) from exc
+        # No email is sent here any more, so there is nothing for a mail
+        # failure to roll back — see services.request_registration.
+        with transaction.atomic():
+            registration = services.request_registration(
+                **serializer.validated_data, http_request=request
+            )
 
         return Response(
             RegistrationRequestSerializer(registration).data,
@@ -896,11 +891,6 @@ class RegistrationRequestViewSet(viewsets.ReadOnlyModelViewSet):
             raise self._conflict(exc) from exc
 
         return Response(RegistrationRequestSerializer(registration).data)
-
-    permission_classes = [*AUTHENTICATED, CanUpdateTables]
-    queryset = LoginAttempt.objects.select_related("user")
-    serializer_class = LoginAttemptSerializer
-    filterset_fields = ["email", "succeeded", "user"]
 
 
 @extend_schema(

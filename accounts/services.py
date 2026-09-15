@@ -208,14 +208,35 @@ REGISTRATION_STALE_CODE = (
 
 @transaction.atomic
 def request_registration(*, first_name, last_name, email, phone_number="", http_request=None):
-    """Record a request for an account, and immediately email a code
-    proving the address belongs to whoever is asking. Open to anyone —
-    there is no user yet to authenticate as.
+    """Record a request for an account. Open to anyone — there is no user yet
+    to authenticate as.
+
+    ---------------------------------------------------------------------
+    No email code
+    ---------------------------------------------------------------------
+    Asking for access used to email a six-digit code the registrant had to
+    type back before a lead could see the request at all. Removed 15
+    September 2026 at ERA 92's request, and it was doing less than it looked
+    like it was:
+
+    **A lead approves every request by hand.** Nothing is created until one
+    does. The code proved the address was reachable, which is worth knowing —
+    but it is also the first thing that happens after approval, when the
+    account's own credentials are sent to that address. An address nobody
+    holds fails there, before anyone can sign in with it.
+
+    **It lost real requests.** A code that landed in spam, or a registrant
+    who closed the tab, left a request no lead could see and no one could
+    resend — it did not appear in the pending list, so nobody knew to chase
+    it.
+
+    The verification model and `verify_registration_email()` are left in
+    place: existing rows carry a `verified_at` worth keeping, and a future
+    self-service flow may want it back. Nothing calls it on this path.
 
     Does not check whether the address already belongs to a `User` or an
     earlier request: that is a lead's call to make when reviewing the list,
-    not a reason to refuse the request outright (an old, unconfirmed
-    address should not block someone from asking again).
+    not a reason to refuse the request outright.
     """
     from .models import RegistrationRequest
 
@@ -227,8 +248,6 @@ def request_registration(*, first_name, last_name, email, phone_number="", http_
     )
     registration.full_clean()
     registration.save()
-
-    send_registration_verification(registration, request=http_request)
 
     return registration
 
@@ -350,12 +369,6 @@ def approve_registration(request, *, role, warehouse=None, school=None, decided_
             f"This request was already {request.status.lower()} and cannot be decided again."
         )
 
-    if not request.is_email_verified:
-        raise RegistrationEmailNotVerified(
-            "This address has not been confirmed yet — the registrant must "
-            "enter the code emailed to them before this can be approved."
-        )
-
     user, password = create_staff_user(
         first_name=request.first_name,
         last_name=request.last_name,
@@ -365,7 +378,23 @@ def approve_registration(request, *, role, warehouse=None, school=None, decided_
         warehouse=warehouse,
         school=school,
     )
-    send_email_verification(user, sent_by=decided_by, request=http_request)
+
+    # Approving **is** the confirmation.
+    #
+    # Two things used to sit here and both have gone. The first was a guard
+    # refusing to approve a request whose address nobody had verified —
+    # which, once the registration code was removed, meant no request could
+    # ever be approved. The second emailed the new account a verification
+    # code, leaving `email_verified_at` null until they typed it, so the
+    # person a lead had just approved was told at sign-in that their address
+    # "has not been confirmed yet".
+    #
+    # A lead looked at this person and decided they get an account. Their
+    # credentials are emailed to that address by `create_staff_user`, so an
+    # address nobody holds fails there — before anyone can sign in with it.
+    # A second code proves nothing the first email does not.
+    user.email_verified_at = timezone.now()
+    user.save(update_fields=["email_verified_at"])
 
     request.status = request.Status.APPROVED
     request.decided_at = timezone.now()
