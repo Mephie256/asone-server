@@ -60,18 +60,22 @@ class ActiveOrdersCountTests(APITestCase):
             created_by=self.lead,
         )
 
-    def test_counts_hold_released_and_picked_only(self):
+    def test_counts_everything_except_completed_and_cancelled(self):
+        """"Active" is an order the school is still waiting on — including
+        one that has shipped but not yet been confirmed received. Only
+        Completed and Cancelled are history."""
         self._order(status_value=OrderStatus.HOLD)
         self._order(status_value=OrderStatus.RELEASED)
         self._order(status_value=OrderStatus.PICKED)
-        # These two should NOT be counted — done, or withdrawn.
         self._order(status_value=OrderStatus.SHIPPED)
+        # These two should NOT be counted — done, or withdrawn.
+        self._order(status_value=OrderStatus.COMPLETED)
         self._order(status_value=OrderStatus.CANCELLED)
 
         url = reverse("catalog:school-detail", args=[self.sites["school_a"].id])
         response = self.client.get(url)
 
-        self.assertEqual(response.data["active_orders_count"], 3)
+        self.assertEqual(response.data["active_orders_count"], 4)
 
     def test_a_school_with_no_orders_counts_zero_not_null(self):
         url = reverse("catalog:school-detail", args=[self.sites["school_a"].id])
