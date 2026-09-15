@@ -24,11 +24,11 @@ class DashboardSummarySerializer(serializers.Serializer):
     outstanding_backorders = serializers.IntegerField(
         help_text="Backorders open or assigned, not yet shipped."
     )
+    units_shipped_today = serializers.IntegerField(
+        help_text="Garments that left this warehouse today, across every van."
+    )
     skus_below_minimum = serializers.IntegerField(
         help_text="SKUs at or under their reorder floor."
-    )
-    units_shipped_today = serializers.IntegerField(
-        help_text="Units on shipments with today's date as shipped_on."
     )
 
 
@@ -41,7 +41,8 @@ class AttentionAlertSerializer(serializers.Serializer):
 
     kind = serializers.CharField(
         help_text="Stable identifier for the frontend to route on: "
-        "low_stock, orders_on_hold, receipts_unreconciled, backorders_fillable."
+        "low_stock, orders_on_hold, receipts_unreconciled, backorders_fillable, "
+        "registrations_pending."
     )
     level = serializers.CharField(help_text="CRITICAL, HOLD, INSPECTION or READY.")
     count = serializers.IntegerField()

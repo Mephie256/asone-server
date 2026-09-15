@@ -22,10 +22,12 @@ from django.db.models import Count, DecimalField, F, IntegerField, Sum, Value
 from django.db.models.functions import Coalesce
 from django.utils import timezone
 
+from accounts.models import RegistrationRequest
+from accounts.permissions import ALL_SITE_ROLES, has_role
 from catalog.models import Sku
 from inventory.models import MovementType, StockMovement, StockStatus
 from inventory.services import below_minimum, stock_levels
-from orders.models import Backorder, Shipment, ShipmentLine
+from orders.models import Backorder, Shipment
 from orders.models.backorders import BackorderStatus
 from orders.models.school_orders import OrderStatus, SchoolOrder, SchoolOrderLine
 from procurement.models import ProductionOrder, Receipt
@@ -87,9 +89,31 @@ def orders_awaiting_dispatch(warehouse=None):
     """
     return (
         _orders_for(warehouse)
-        .filter(status=OrderStatus.PICKED, shipments__isnull=True)
+        # F42: an order reaches a van through its lines now, so "not yet
+        # despatched" is "no shipment line points at it".
+        .filter(status=OrderStatus.PICKED, shipment_lines__isnull=True)
         .count()
     )
+
+
+def units_shipped_today(warehouse=None):
+    """Garments that left the building today.
+
+    Counted from the shipment lines rather than the ledger: a van is the
+    document, and "what went out today" is a question about vans. Summed
+    over lines so a consolidated despatch carrying four orders counts its
+    garments once each, not its orders.
+    """
+    from django.db.models import Sum
+    from django.utils import timezone
+
+    from orders.models import ShipmentLine
+
+    lines = ShipmentLine.objects.filter(shipment__shipped_on=timezone.localdate())
+    if warehouse is not None:
+        lines = lines.filter(shipment__from_warehouse=warehouse)
+
+    return lines.aggregate(total=Sum("quantity"))["total"] or 0
 
 
 def outstanding_backorders(warehouse=None):
@@ -105,23 +129,6 @@ def outstanding_backorders(warehouse=None):
 def skus_below_minimum(warehouse=None):
     """How many SKUs are at or under their reorder floor — "low stock"."""
     return len(below_minimum(warehouse=warehouse))
-
-
-def units_shipped_today(warehouse=None):
-    """Units that left a warehouse today — the warehouse hub console's
-    "Shipped Today" tile.
-
-    Counted from `shipped_on`, the day the van left, not `created_at` — a
-    shipment entered a day late should count against the day it actually
-    went, the same reasoning `shipments_costed()` applies with `_within()`.
-    """
-    lines = ShipmentLine.objects.filter(shipment__shipped_on=date.today())
-    if warehouse is not None:
-        lines = lines.filter(shipment__from_warehouse=warehouse)
-
-    return lines.aggregate(
-        units=Coalesce(Sum("quantity"), Value(0), output_field=IntegerField())
-    )["units"]
 
 
 def summary(warehouse=None):
@@ -203,8 +210,8 @@ def backorders_ready_to_fill(warehouse=None):
     ]
 
 
-def needs_attention(warehouse=None):
-    """The alert list — four kinds of thing somebody should look at.
+def needs_attention(warehouse=None, user=None):
+    """The alert list — the things somebody should look at.
 
     Each row is a count and a sentence, not a list: the design shows one line
     per kind with a chip, and the row links through to the screen that has
@@ -213,6 +220,12 @@ def needs_attention(warehouse=None):
 
     Rows with a count of zero are omitted. An empty list means there is
     genuinely nothing to do, which is worth being able to say.
+
+    ``user`` is needed for the rows that are not about a site at all. A
+    pending registration belongs to whoever administers accounts, not to a
+    warehouse, so it cannot be selected by `warehouse` the way the rest are.
+    Omitted when no user is passed, which keeps every existing caller — and
+    every test — behaving exactly as before.
     """
     alerts = []
 
@@ -227,6 +240,11 @@ def needs_attention(warehouse=None):
             }
         )
 
+    # HOLD means "awaiting payment" — see OrderStatus. This row said
+    # "waiting for stock", which is a different queue entirely and now a real
+    # one (F43, orders_awaiting_stock). A warehouse user reading the old
+    # wording went looking for goods to receive when what was actually
+    # waiting was a parent paying an invoice.
     on_hold = _orders_for(warehouse).filter(status=OrderStatus.HOLD).count()
     if on_hold:
         alerts.append(
@@ -234,9 +252,40 @@ def needs_attention(warehouse=None):
                 "kind": "orders_on_hold",
                 "level": HOLD,
                 "count": on_hold,
-                "message": f"{on_hold} school orders waiting for stock",
+                "message": (
+                    f"{on_hold} school orders waiting for payment"
+                    if on_hold != 1
+                    else "1 school order waiting for payment"
+                ),
             }
         )
+
+    # Somebody asked for an account and is waiting on a human. Only the
+    # roles that can actually approve one are shown it — a row nobody can
+    # act on is noise, and this is the list people are meant to trust.
+    #
+    # Unverified requests are excluded: a lead cannot approve a request whose
+    # email address nobody has proved they hold, so surfacing one would
+    # present work that cannot be done. It appears the moment they enter
+    # their code.
+    if user is not None and has_role(user, *ALL_SITE_ROLES):
+        pending = RegistrationRequest.objects.filter(
+            status=RegistrationRequest.Status.PENDING,
+            verified_at__isnull=False,
+        ).count()
+        if pending:
+            alerts.append(
+                {
+                    "kind": "registrations_pending",
+                    "level": HOLD,
+                    "count": pending,
+                    "message": (
+                        f"{pending} people waiting for an account"
+                        if pending != 1
+                        else "1 person waiting for an account"
+                    ),
+                }
+            )
 
     unreconciled = len(receipts_needing_reconciliation(warehouse))
     if unreconciled:
@@ -257,6 +306,34 @@ def needs_attention(warehouse=None):
                 "level": READY,
                 "count": fillable,
                 "message": f"{fillable} backorders eligible for release",
+            }
+        )
+
+    # Parcels that left and nobody ever said arrived.
+    #
+    # **This is the alert the Shipped/Completed split exists for.** Keeping
+    # the two apart makes a lost delivery visible — but only if somebody who
+    # can chase it is told. Without this the gap was recorded and shown to
+    # nobody: the school sees its own parcels, and the school is not who
+    # rings the warehouse.
+    #
+    # Fourteen days, because everything shipped this morning is unconfirmed
+    # and none of it is a problem yet.
+    from orders.services.shipping import shipments_awaiting_confirmation
+
+    stale = len(
+        list(shipments_awaiting_confirmation(warehouse=warehouse, older_than_days=14))
+    )
+    if stale:
+        alerts.append(
+            {
+                "kind": "deliveries_unconfirmed",
+                "level": CRITICAL,
+                "count": stale,
+                "message": (
+                    f"{stale} deliver{'y' if stale == 1 else 'ies'} shipped over "
+                    "14 days ago and never confirmed"
+                ),
             }
         )
 
@@ -314,7 +391,7 @@ def recent_activity(warehouse=None, limit=10):
         )
 
     shipments = Shipment.objects.filter(shipped_on__gte=since).select_related(
-        "order", "order__school"
+        "school"
     )
     if warehouse is not None:
         shipments = shipments.filter(from_warehouse=warehouse)
@@ -323,10 +400,9 @@ def recent_activity(warehouse=None, limit=10):
             {
                 "at": shipment.created_at,
                 "kind": "shipment",
-                "reference": shipment.order.number,
+                "reference": shipment.number,
                 "description": (
-                    f"Order {shipment.order.number} shipped to "
-                    f"{shipment.order.school.name}"
+                    f"{shipment.number} shipped to {shipment.school.name}"
                 ),
             }
         )
@@ -832,9 +908,9 @@ def school_deliveries_to_confirm(school):
     today = timezone.localdate()
 
     shipments = (
-        Shipment.objects.filter(order__school=school, received_at__isnull=True)
-        .exclude(order__status=OrderStatus.CANCELLED)
-        .select_related("order", "from_warehouse")
+        Shipment.objects.filter(school=school, received_at__isnull=True)
+        .select_related("from_warehouse")
+        .prefetch_related("lines__order")
         .order_by("shipped_on")
     )
 
@@ -842,9 +918,15 @@ def school_deliveries_to_confirm(school):
         {
             "id": shipment.id,
             "number": shipment.number,
-            "order_id": shipment.order_id,
-            "order_number": shipment.order.number,
-            "student_name": shipment.order.student_name,
+            # F42: a van can carry several orders, so the row names the
+            # shipment and lists what is on it rather than pretending to one.
+            "order_id": next((line.order_id for line in shipment.lines.all()), None),
+            "order_number": ", ".join(
+                sorted({line.order.number for line in shipment.lines.all()})
+            ),
+            "student_name": ", ".join(
+                sorted({line.order.student_name for line in shipment.lines.all()})
+            ),
             "shipped_on": shipment.shipped_on,
             "days_in_transit": (today - shipment.shipped_on).days,
             # Usually the school's own warehouse — but a backorder may be

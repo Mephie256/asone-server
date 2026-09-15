@@ -7,6 +7,8 @@ school's orders and can only create orders for that school.
 """
 
 from django.db.models import Prefetch
+from django.db.models.functions import Coalesce
+from django.shortcuts import get_object_or_404
 from drf_spectacular.types import OpenApiTypes
 from drf_spectacular.utils import OpenApiParameter, extend_schema
 from rest_framework import status, viewsets
@@ -25,6 +27,8 @@ from accounts.permissions import (
     CanTransferBackorders,
     scope_to_user_site,
 )
+from catalog.models import School, Warehouse
+from config.pagination import SizedPageNumberPagination
 from catalog.services import PriceNotSet
 
 from . import reports, services
@@ -40,6 +44,13 @@ from .permissions import (
 )
 from .serializers import (
     AssignBackorderSerializer,
+    TransferOrderSerializer,
+    PickingQueueRowSerializer,
+    ReleaseEligibleSerializer,
+    PickingQueueSerializer,
+    PickingSummarySerializer,
+    DespatchSerializer,
+    ReadyToDespatchSerializer,
     CostedShipmentSerializer,
     PackingListSerializer,
     PartProcessedOrderSerializer,
@@ -85,7 +96,7 @@ def _date_param(request, name):
 _WAREHOUSE_ACTIONS = frozenset(
     {
         "availability", "pick_list", "pick", "pick_available",
-        "ship", "shipments", "backorders",
+        "ship", "shipments", "backorders", "unpick",
     }
 )
 
@@ -103,6 +114,11 @@ _PAYMENT_ACTIONS = frozenset({"release"})
 #: not belong behind a permission whose refusal talks about placing orders.
 #: Its own class is also where Q7 lands if schools cannot get online.
 _RECEIPT_ACTIONS = frozenset({"confirm_receipt"})
+
+#: F45. Not Warehouse Receiving: D5 gives Warehouse Staff a Backorder
+#: Transfers capability of its own, and it is the one thing a warehouse user
+#: does that reaches past their own site. Its own column, its own class.
+_TRANSFER_ACTIONS = frozenset({"transfer", "transfer_candidates"})
 
 
 @extend_schema(tags=["Orders — point of sale"])
@@ -167,6 +183,8 @@ class SchoolOrderViewSet(viewsets.ModelViewSet):
             return [permission() for permission in [*AUTHENTICATED, CanConfirmPayment]]
         if self.action in _RECEIPT_ACTIONS:
             return [permission() for permission in [*AUTHENTICATED, CanConfirmReceipt]]
+        if self.action in _TRANSFER_ACTIONS:
+            return [permission() for permission in [*AUTHENTICATED, CanTransferBackorders]]
         if self.action == "packing_lists":
             # F40 leaves the School Staff cell blank — see CanReadPackingList,
             # which explains why that is worth querying with AsOne.
@@ -188,11 +206,24 @@ class SchoolOrderViewSet(viewsets.ModelViewSet):
         # warehouse_field for Warehouse Staff reaching availability/
         # pick_list/pick — without both, a warehouse clerk's requests would
         # pass CanReceiveAndShip and then find an empty queryset.
+        #
+        # The warehouse path is the *effective* one, not the school's own.
+        # After an F45 transfer those differ, and D2 is explicit that the
+        # warehouse doing the filling must see what it is filling —
+        # including for a school that is not "theirs". Scoping on
+        # school__primary_warehouse would hide the order from the warehouse
+        # that had just accepted it, and keep showing it to the one that
+        # gave it away.
+        queryset = queryset.annotate(
+            effective_warehouse=Coalesce(
+                "fulfilled_by_warehouse", "school__primary_warehouse"
+            )
+        )
         return scope_to_user_site(
             queryset,
             self.request.user,
             school_field="school",
-            warehouse_field="school__primary_warehouse",
+            warehouse_field="effective_warehouse",
         )
 
     def get_serializer_class(self):
@@ -340,6 +371,71 @@ class SchoolOrderViewSet(viewsets.ModelViewSet):
         return Response(SchoolOrderSerializer(order).data)
 
     @extend_schema(
+        summary="Warehouses that could fill this order",
+        responses={200: OpenApiTypes.OBJECT},
+        description=(
+            "F45's shortlist — which warehouses hold enough of **every** "
+            "line to finish the order.\n\n"
+            "Every line, not some. Under the pack's hold-complete rule "
+            "(p.8) a transfer is only worth making to a warehouse that can "
+            "finish the job; offering one that would itself come up short "
+            "just moves the waiting somewhere else.\n\n"
+            "The warehouse currently responsible is excluded. A clerk "
+            "cannot see another site's shelves, so asking them to guess is "
+            "how an order gets sent somewhere empty."
+        ),
+    )
+    @action(detail=True, methods=["get"], url_path="transfer-candidates")
+    def transfer_candidates(self, request, pk=None):
+        order = self.get_object()
+        return Response(
+            [
+                {"id": warehouse.pk, "name": warehouse.name}
+                for warehouse in services.warehouses_that_could_fill_order(order)
+            ]
+        )
+
+    @extend_schema(
+        summary="Transfer the order to a warehouse with stock",
+        request=TransferOrderSerializer,
+        responses={200: SchoolOrderSerializer},
+        description=(
+            "F45 — p.8's \"option to transfer an order to another warehouse "
+            "with Inventory\", and decision D2.\n\n"
+            "**Nothing moves in the ledger.** No stock is reserved at "
+            "either end; the receiving warehouse picks in the ordinary way "
+            "afterwards and that pick is what touches inventory. What "
+            "changes here is who is responsible.\n\n"
+            "The school keeps its primary warehouse — D2 is two rules and "
+            "this is only the fulfilment one. Future orders are unaffected."
+            "\n\nRefused if the target cannot fill every line, if it is "
+            "already the one filling it, or if the order has been picked: "
+            "stock is reserved by then, and re-pointing the order would "
+            "strand that reservation."
+        ),
+    )
+    @action(detail=True, methods=["post"])
+    def transfer(self, request, pk=None):
+        order = self.get_object()
+        serializer = TransferOrderSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        try:
+            services.transfer_order(
+                order,
+                warehouse=serializer.validated_data["warehouse"],
+                transferred_by=request.user,
+                reason=serializer.validated_data.get("reason", ""),
+            )
+        except services.OrderNotTransferable as exc:
+            raise DRFValidationError({"detail": str(exc)}) from exc
+        except services.NoStockToFill as exc:
+            raise DRFValidationError({"detail": str(exc)}) from exc
+
+        order.refresh_from_db()
+        return Response(SchoolOrderSerializer(order).data)
+
+    @extend_schema(
         summary="The invoice",
         responses=InvoiceSerializer,
         description=(
@@ -459,6 +555,39 @@ class SchoolOrderViewSet(viewsets.ModelViewSet):
         )
 
     @extend_schema(
+        summary="Undo a pick",
+        request=None,
+        responses={200: SchoolOrderSerializer},
+        description=(
+            "Puts a mistakenly picked order back on the shelf — the undo for "
+            "F39.\n\n"
+            "Picking is one click and it reserves stock, so a wrong click can "
+            "refuse the next school's order for a shortfall that is not real. "
+            "This posts the **offsetting** ledger pair — out of Pick, back "
+            "into Available — at the value the stock is carried at. Nothing "
+            "is deleted: the ledger is append-only and the history reads as "
+            "what happened.\n\n"
+            "Refused once the order has shipped. Stock that has left the "
+            "building comes back as a return, not by undoing a pick."
+        ),
+    )
+    @action(detail=True, methods=["post"])
+    def unpick(self, request, pk=None):
+        order = self.get_object()
+
+        try:
+            services.unpick_order(
+                order,
+                unpicked_by=request.user,
+                reason=(request.data or {}).get("reason", ""),
+            )
+        except services.OrderCannotBeUnpicked as exc:
+            raise DRFValidationError({"status": str(exc)}) from exc
+
+        order.refresh_from_db()
+        return Response(SchoolOrderSerializer(order).data)
+
+    @extend_schema(
         summary="Shipments for this order",
         responses=ShipmentSerializer(many=True),
         description=(
@@ -471,8 +600,8 @@ class SchoolOrderViewSet(viewsets.ModelViewSet):
     def shipments(self, request, pk=None):
         order = self.get_object()
         rows = order.shipments.select_related(
-            "from_warehouse", "order", "shipped_by"
-        ).prefetch_related("lines__sku")
+            "from_warehouse", "school", "shipped_by"
+        ).prefetch_related("lines__sku", "lines__order")
         return Response(ShipmentSerializer(rows, many=True).data)
 
     @extend_schema(
@@ -558,8 +687,8 @@ class SchoolOrderViewSet(viewsets.ModelViewSet):
     def packing_lists(self, request, pk=None):
         order = self.get_object()
         shipments = order.shipments.select_related(
-            "from_warehouse", "order__school", "order__school__primary_warehouse"
-        ).prefetch_related("lines__sku__garment")
+            "from_warehouse", "school", "school__primary_warehouse"
+        ).prefetch_related("lines__sku__garment", "lines__order")
 
         return Response(
             PackingListSerializer(
@@ -781,6 +910,65 @@ class BackorderViewSet(viewsets.ReadOnlyModelViewSet):
         return Response(BackorderSerializer(backorder).data)
 
     @extend_schema(
+        summary="Backorders that could be filled today",
+        responses=BackorderSerializer(many=True),
+        description=(
+            "Open backorders some warehouse is holding stock for — the queue "
+            "behind Release All Eligible.\n\n"
+            "Checks **every** warehouse, not just the school's own: decision "
+            "D2 lets another warehouse ship direct, so stock at Serere can "
+            "fill a Namayemba shortfall."
+        ),
+    )
+    @action(detail=False, methods=["get"], url_path="eligible")
+    def eligible(self, request):
+        rows = services.eligible_for_release(request.user.warehouse)
+        return Response(BackorderSerializer(rows, many=True).data)
+
+    @extend_schema(
+        summary="Release every eligible backorder",
+        request=ReleaseEligibleSerializer,
+        responses={201: ShipmentSerializer(many=True)},
+        description=(
+            "Assigns each backorder to the warehouse holding the most of "
+            "that SKU and ships it direct to the school — the same two steps "
+            "as `assign` then `fill`, done together.\n\n"
+            "**All or nothing.** One transaction, so a backorder that cannot "
+            "be filled halfway through does not leave half the queue "
+            "released: a clerk who pressed one button gets one outcome."
+        ),
+    )
+    @action(detail=False, methods=["post"], url_path="release-eligible")
+    def release_eligible(self, request):
+        chosen = ReleaseEligibleSerializer(data=request.data)
+        chosen.is_valid(raise_exception=True)
+        ids = chosen.validated_data.get("backorders")
+
+        queryset = self.get_queryset()
+        picked = list(queryset.filter(pk__in=ids)) if ids else None
+
+        if ids and len(picked) != len(set(ids)):
+            raise DRFValidationError(
+                {"backorders": "Some of those are not yours, or do not exist."}
+            )
+
+        try:
+            shipments = services.release_eligible(
+                released_by=request.user,
+                warehouse=request.user.warehouse,
+                backorders=picked,
+            )
+        except services.NoStockToFill as exc:
+            raise DRFValidationError({"backorders": str(exc)}) from exc
+        except services.CannotAssign as exc:
+            raise DRFValidationError({"status": str(exc)}) from exc
+
+        return Response(
+            ShipmentSerializer(shipments, many=True).data,
+            status=status.HTTP_201_CREATED,
+        )
+
+    @extend_schema(
         summary="Ship it direct to the school",
         request=FillBackorderSerializer,
         responses={201: ShipmentSerializer},
@@ -818,32 +1006,6 @@ class BackorderViewSet(viewsets.ReadOnlyModelViewSet):
 
         return Response(
             ShipmentSerializer(shipment).data, status=status.HTTP_201_CREATED
-        )
-
-
-class ShipmentViewSet(viewsets.ReadOnlyModelViewSet):
-    """What has left a warehouse — F41, read-only.
-
-    Every shipment is already created through an action elsewhere (`ship`
-    on a school order, `fill` on a backorder) — this is the resource those
-    actions leave behind, listable on its own for a warehouse's own recent
-    dispatch history rather than reached one order at a time.
-
-    Same matrix column as receiving: `CanReceiveAndShip`. Warehouse Staff see
-    their own site's despatches; the leads see every site's.
-    """
-
-    queryset = Shipment.objects.none()
-    serializer_class = ShipmentSerializer
-    permission_classes = [*AUTHENTICATED, CanReceiveAndShip]
-    filterset_fields = ("from_warehouse", "order")
-
-    def get_queryset(self):
-        queryset = Shipment.objects.select_related(
-            "order", "order__school", "from_warehouse", "shipped_by"
-        ).prefetch_related("lines__sku")
-        return scope_to_user_site(
-            queryset, self.request.user, warehouse_field="from_warehouse"
         )
 
 
@@ -966,3 +1128,337 @@ class CostedShipmentsView(APIView):
             date_to=_date_param(request, "to"),
         )
         return Response(CostedShipmentSerializer(rows, many=True).data)
+
+
+@extend_schema(tags=["Orders — fulfilment"])
+class ShipmentViewSet(viewsets.ReadOnlyModelViewSet):
+    """Everything that has left a warehouse — F41.
+
+    **Read only, deliberately.** A shipment is not created by posting to a
+    collection; it is created by `ship_order()`, which moves reserved stock
+    out of the ledger in the same transaction. Letting a client POST a
+    shipment row would let it claim goods left the building without the stock
+    ever moving, which is the one thing the ledger exists to prevent.
+    Despatch stays `POST /school-orders/{id}/ship/`.
+
+    ## Who sees it
+
+    The same audience as the fulfilment reports: the two leads everywhere,
+    warehouse staff for their own site, and a school for its own parcels.
+    Finance is excluded — the matrix gives them the costed reports, not the
+    operational backlog, and the costed view of exactly these rows already
+    exists at `reports/shipments-costed/`.
+
+    Scoping is two-sided: a warehouse clerk sees what left their warehouse, a
+    school sees what is coming to it. Those are different columns, so the two
+    are handled separately rather than by one call that can only mean one.
+    """
+
+    permission_classes = [*AUTHENTICATED, CanReadFulfilmentReports]
+    serializer_class = ShipmentSerializer
+    filterset_fields = ("from_warehouse", "shipped_on")
+    search_fields = ("number", "lines__order__number", "school__name")
+
+    def get_queryset(self):
+        queryset = (
+            Shipment.objects.select_related("school", "from_warehouse", "shipped_by")
+            .prefetch_related("lines__sku", "lines__order")
+            .order_by("-shipped_on", "-number")
+        )
+
+        user = self.request.user
+        if getattr(user, "role", None) == User.Role.SCHOOL_STAFF:
+            return scope_to_user_site(queryset, user, school_field="school")
+
+        return scope_to_user_site(queryset, user, warehouse_field="from_warehouse")
+
+    @extend_schema(
+        summary="Shipments",
+        parameters=[
+            OpenApiParameter("school", OpenApiTypes.INT, description="Destination school id."),
+            OpenApiParameter(
+                "status",
+                OpenApiTypes.STR,
+                description="SHIPPED (left, not yet confirmed) or DELIVERED (school confirmed).",
+            ),
+            OpenApiParameter("shipped_from", OpenApiTypes.DATE, description="On or after, YYYY-MM-DD."),
+            OpenApiParameter("shipped_to", OpenApiTypes.DATE, description="On or before, YYYY-MM-DD."),
+            OpenApiParameter("search", OpenApiTypes.STR, description="Shipment or order number, or school name."),
+        ],
+        description=(
+            "What has left the warehouses, newest first.\n\n"
+            "`status` is **derived**, not stored: SHIPPED means it left, "
+            "DELIVERED means the school confirmed it arrived. There is no "
+            "'preparing' state — a shipment row does not exist until despatch "
+            "creates it."
+        ),
+    )
+    def list(self, request, *args, **kwargs):
+        return super().list(request, *args, **kwargs)
+
+    def filter_queryset(self, queryset):
+        queryset = super().filter_queryset(queryset)
+
+        school = self.request.query_params.get("school")
+        if school:
+            queryset = queryset.filter(school_id=school)
+
+        wanted = (self.request.query_params.get("status") or "").upper()
+        if wanted == "DELIVERED":
+            queryset = queryset.filter(received_at__isnull=False)
+        elif wanted == "SHIPPED":
+            queryset = queryset.filter(received_at__isnull=True)
+
+        # The design's date-range control. Both ends inclusive, as a person
+        # means when they ask for August.
+        shipped_from = _date_param(self.request, "shipped_from")
+        if shipped_from:
+            queryset = queryset.filter(shipped_on__gte=shipped_from)
+
+        shipped_to = _date_param(self.request, "shipped_to")
+        if shipped_to:
+            queryset = queryset.filter(shipped_on__lte=shipped_to)
+
+        return queryset
+
+
+@extend_schema(tags=["Orders — fulfilment"])
+class DespatchQueueView(APIView):
+    """What is picked and waiting to go, grouped by school — F42.
+
+    The despatch screen's list: a school, how many of its orders are ready,
+    and how many garments that is. Grouped because the van is per school.
+    """
+
+    permission_classes = [*AUTHENTICATED, CanReceiveAndShip]
+
+    @extend_schema(
+        summary="Schools with orders ready to despatch",
+        responses=ReadyToDespatchSerializer(many=True),
+    )
+    def get(self, request):
+        warehouse = request.user.warehouse
+        if warehouse is None:
+            requested = request.query_params.get("warehouse")
+            if not requested:
+                raise DRFValidationError(
+                    {"warehouse": "Say which warehouse you are despatching from."}
+                )
+            warehouse = get_object_or_404(Warehouse, pk=requested)
+
+        rows = services.orders_ready_to_despatch(warehouse)
+        return Response(ReadyToDespatchSerializer(rows, many=True).data)
+
+
+@extend_schema(tags=["Orders — fulfilment"])
+class DespatchView(APIView):
+    """Send a school's picked orders out on one van — F42.
+
+    AsOne's checklist asks for a consolidated weekly despatch per school. The
+    van is the document; the stock moves exactly as it would shipping each
+    order on its own, so a consolidated despatch and a single one are worth
+    the same to Finance.
+    """
+
+    permission_classes = [*AUTHENTICATED, CanReceiveAndShip]
+
+    @extend_schema(
+        summary="Despatch to a school",
+        request=DespatchSerializer,
+        responses={201: ShipmentSerializer},
+        description=(
+            "Loads every picked order waiting for that school onto one "
+            "shipment, or just the ones named in `orders`.\n\n"
+            "Refused if an order is not picked, is cancelled, or belongs to "
+            "another school — a clerk who asked for it to go needs to know "
+            "it did not, rather than find it left behind."
+        ),
+    )
+    def post(self, request):
+        serializer = DespatchSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        school = get_object_or_404(School, pk=data["school"])
+
+        warehouse = request.user.warehouse
+        if data.get("from_warehouse"):
+            warehouse = get_object_or_404(Warehouse, pk=data["from_warehouse"])
+        if warehouse is None:
+            raise DRFValidationError(
+                {"from_warehouse": "Say which warehouse this is leaving from."}
+            )
+
+        # A clerk despatches from their own site and no other.
+        if not scope_to_user_site(
+            Warehouse.objects.filter(pk=warehouse.pk),
+            request.user,
+            warehouse_field="pk",
+        ).exists():
+            raise PermissionDenied("That is not your warehouse.")
+
+        orders = None
+        if data.get("orders"):
+            orders = list(
+                scope_to_user_site(
+                    SchoolOrder.objects.filter(pk__in=data["orders"]),
+                    request.user,
+                    warehouse_field="school__primary_warehouse",
+                    school_field="school",
+                )
+            )
+            missing = set(data["orders"]) - {order.pk for order in orders}
+            if missing:
+                raise DRFValidationError(
+                    {"orders": f"Not found, or not yours: {sorted(missing)}."}
+                )
+
+        try:
+            shipment = services.despatch_to_school(
+                school=school,
+                from_warehouse=warehouse,
+                shipped_by=request.user,
+                orders=orders,
+                shipped_on=data.get("shipped_on"),
+                waybill_number=data.get("waybill_number", ""),
+                carrier_method=data.get("carrier_method", ""),
+                notes=data.get("notes", ""),
+            )
+        except services.NothingReadyToDespatch as exc:
+            raise DRFValidationError({"orders": str(exc)}) from exc
+        except (services.OrderCannotBeShipped, services.NothingToShip) as exc:
+            raise DRFValidationError({"orders": str(exc)}) from exc
+
+        return Response(
+            ShipmentSerializer(shipment).data, status=status.HTTP_201_CREATED
+        )
+
+
+@extend_schema(tags=["Orders — fulfilment"])
+class OrdersAwaitingStockView(APIView):
+    """Released orders their warehouse cannot fill — F43, F44.
+
+    The queue page 8 of the pack describes: "orders held until enough
+    inventory is received to release a picklist", "released in a FIFO
+    sequence". Oldest first, because that is what FIFO means here — the
+    sequence the schools placed them in, not the sequence somebody opened
+    them in.
+
+    Each row carries what it is waiting on, so the screen can say *why* an
+    order is stuck rather than only that it is. A clerk looking at this is
+    deciding whether to wait for the next delivery or transfer the order,
+    and they cannot decide that without seeing the shortfall.
+    """
+
+    permission_classes = [*AUTHENTICATED, CanReceiveAndShip]
+
+    @extend_schema(
+        summary="Orders waiting for stock",
+        responses={200: OpenApiTypes.OBJECT},
+        parameters=[
+            OpenApiParameter(
+                "warehouse",
+                OpenApiTypes.INT,
+                description="Required for an all-locations role; ignored for a clerk.",
+            ),
+        ],
+        description=(
+            "F43 and F44 — the held-order queue, oldest first.\n\n"
+            "An order appears here when it has been paid for and its "
+            "warehouse cannot fill **every** line. Under the pack's rule "
+            "(p.8) nothing part-ships, so a single short line holds the "
+            "whole order.\n\n"
+            "It leaves the queue by one of two routes: stock arrives and it "
+            "can be picked, or it is transferred to a warehouse that has "
+            "the stock — `school-orders/{id}/transfer/`.\n\n"
+            "Derived on read, not a stored list. There is no backorder "
+            "record to create, resolve or clean up."
+        ),
+    )
+    def get(self, request):
+        warehouse = request.user.warehouse
+        if warehouse is None:
+            requested = request.query_params.get("warehouse")
+            warehouse = (
+                get_object_or_404(Warehouse, pk=requested) if requested else None
+            )
+
+        return Response(
+            [
+                {
+                    "order": SchoolOrderSerializer(entry["order"]).data,
+                    "waiting_on": [
+                        {
+                            "sku": row["sku"].number,
+                            "description": row["sku"].description,
+                            "needed": row["needed"],
+                            "available": row["available"],
+                            "shortfall": row["shortfall"],
+                        }
+                        for row in entry["shortfalls"]
+                    ],
+                }
+                for entry in services.orders_awaiting_stock(warehouse)
+            ]
+        )
+
+
+class PickingQueueView(APIView):
+    """What the warehouse has to pull off the shelves — F38.
+
+    The picking screen's landing view: three counts and the backlog itself,
+    most urgent first.
+
+    **There is no "in progress".** `pick_order` is atomic — an order is
+    picked or it is not — because a half-finished reservation would let the
+    ledger say stock is committed to an order nobody completed. Whether
+    picking should be resumable is open question Q4, which AsOne has not
+    answered.
+    """
+
+    permission_classes = [*AUTHENTICATED, CanReceiveAndShip]
+
+    @extend_schema(
+        summary="The picking backlog",
+        responses=PickingQueueSerializer,
+        parameters=[
+            OpenApiParameter(
+                "warehouse",
+                OpenApiTypes.INT,
+                description="Required for an all-locations role; ignored for a clerk.",
+            ),
+            OpenApiParameter("page", OpenApiTypes.INT),
+            OpenApiParameter(
+                "page_size", OpenApiTypes.INT, description="Capped at 200."
+            ),
+        ],
+        description=(
+            "The backlog, most urgent first, paginated.\n\n"
+            "`summary` counts the **whole** queue, not the page: a warehouse "
+            "asking how much is waiting means all of it, and a tile that "
+            "changed as you paged would be worse than no tile."
+        ),
+    )
+    def get(self, request):
+        warehouse = request.user.warehouse
+        if warehouse is None:
+            requested = request.query_params.get("warehouse")
+            warehouse = (
+                get_object_or_404(Warehouse, pk=requested) if requested else None
+            )
+
+        rows = reports.picking_queue(warehouse)
+
+        paginator = SizedPageNumberPagination()
+        page = paginator.paginate_queryset(rows, request, view=self)
+        orders = PickingQueueRowSerializer(page, many=True).data
+
+        return Response(
+            {
+                # Counted over the whole queue, deliberately — see above.
+                "summary": PickingSummarySerializer(
+                    reports.picking_summary(warehouse)
+                ).data,
+                "orders": paginator.get_paginated_response(orders).data,
+            }
+        )

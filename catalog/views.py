@@ -167,12 +167,23 @@ class TailoringCenterViewSet(viewsets.ModelViewSet):
 
 @extend_schema(tags=["Master data — sites"])
 class WarehouseViewSet(viewsets.ModelViewSet):
-    """Where finished stock is held."""
+    """Where finished stock is held.
+
+    Finance reads this, which the matrix's "Warehouses — view: Warehouse
+    Staff" line does not say on its face. It follows from two cells that do:
+    Finance's scope is *all locations*, and F23 gives them adjustments at
+    *all sites*. An adjustment names the warehouse it is posted at, so a role
+    that cannot list warehouses cannot post one — the picker on the New
+    Adjustment screen came up empty and there was no way to choose a site.
+
+    Read only, as for everybody outside the leads. Editing a warehouse is
+    still the Table Updates column.
+    """
 
     queryset = Warehouse.objects.select_related("primary_tailoring_center").order_by("name")
     serializer_class = WarehouseSerializer
     permission_classes = MASTER_DATA
-    read_roles = (Role.WAREHOUSE_STAFF,)
+    read_roles = (Role.WAREHOUSE_STAFF, Role.FINANCE)
     filterset_fields = ("primary_tailoring_center", "is_active")
 
 
@@ -180,28 +191,39 @@ class WarehouseViewSet(viewsets.ModelViewSet):
 class SchoolViewSet(viewsets.ModelViewSet):
     """The customers. Each orders from one primary warehouse."""
 
+    queryset = School.objects.select_related("primary_warehouse").order_by("name")
     serializer_class = SchoolSerializer
     permission_classes = MASTER_DATA
     read_roles = (Role.WAREHOUSE_STAFF, Role.SCHOOL_STAFF)
     filterset_fields = ("level", "primary_warehouse", "is_active")
 
     def get_queryset(self):
-        # Annotated, the same reason Garment's sku_count is: without it,
-        # listing schools costs one query per row rather than one query.
-        #
-        # "Active" here means not yet shipped and not cancelled — HOLD,
-        # RELEASED or PICKED. Worth confirming with AsOne: this counts what
-        # still needs *action*, not every order ever placed, which is a
-        # judgement call in the absence of a stated definition.
+        """Schools, each with what it currently has in flight.
+
+        Annotated rather than counted per row: a list of forty schools
+        should be one query, not forty-one.
+
+        "Active" is an order the school is still waiting on. Completed and
+        cancelled orders are history, and a school with only those is not
+        busy.
+        """
+        from orders.models.school_orders import OrderStatus
+
         return (
-            School.objects.select_related("primary_warehouse")
+            super()
+            .get_queryset()
             .annotate(
                 active_orders_count=Count(
                     "orders",
-                    filter=Q(orders__status__in=["HOLD", "RELEASED", "PICKED"]),
+                    filter=~Q(
+                        orders__status__in=(
+                            OrderStatus.COMPLETED,
+                            OrderStatus.CANCELLED,
+                        )
+                    ),
+                    distinct=True,
                 )
             )
-            .order_by("name")
         )
 
 

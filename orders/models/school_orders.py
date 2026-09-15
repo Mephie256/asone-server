@@ -58,6 +58,25 @@ class OrderStatus(models.TextChoices):
 SCHOOL_ORDER_STATUS_CHOICES = OrderStatus.choices
 
 
+class OrderPriority(models.TextChoices):
+    """How urgently an order should be picked.
+
+    **Not in AsOne's pack.** It appears in the picking-queue design and
+    nowhere in the checklist, the definitions page or the open questions, so
+    it is carried at the mildest reading: a hint the warehouse sets to order
+    its own day, never anything the system acts on. Nothing schedules,
+    escalates or reorders a queue by it.
+
+    Worth confirming with AsOne before anything is built that depends on it —
+    if it should drive FIFO release (F43), that is a different feature with
+    different consequences.
+    """
+
+    NORMAL = "NORMAL", "Normal"
+    HIGH = "HIGH", "High"
+    URGENT = "URGENT", "Urgent"
+
+
 class SchoolOrder(models.Model):
     """One student's uniform order, placed by their school.
 
@@ -91,6 +110,14 @@ class SchoolOrder(models.Model):
         max_length=12, choices=OrderStatus.choices, default=OrderStatus.HOLD
     )
     notes = models.TextField(blank=True)
+
+    # See OrderPriority: a warehouse hint, not a scheduling rule.
+    priority = models.CharField(
+        max_length=8,
+        choices=OrderPriority.choices,
+        default=OrderPriority.NORMAL,
+        help_text="A picking hint for the warehouse. Nothing in the system acts on it.",
+    )
 
     created_by = models.ForeignKey(
         "accounts.User", on_delete=models.PROTECT, related_name="+"
@@ -137,6 +164,40 @@ class SchoolOrder(models.Model):
         ),
     )
 
+    # F45 — "Option to transfer an order to another warehouse with Inventory"
+    # (pack p.8), restated by Jim as decision D2. Null is the ordinary case:
+    # the school's own warehouse fills it. Set only by `transfer_order()`,
+    # and only before picking — once stock is reserved somewhere, moving the
+    # order would leave that reservation behind with nothing pointing at it.
+    #
+    # Deliberately NOT a change to `school.primary_warehouse`. Ordering and
+    # fulfilment are two rules in D2 and collapsing them would let a transfer
+    # silently re-home every future order the school places.
+    fulfilled_by_warehouse = models.ForeignKey(
+        "catalog.Warehouse",
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="orders_accepted",
+        help_text=(
+            "Set when the order was transferred to a warehouse holding stock. "
+            "Empty means the school's own warehouse fills it."
+        ),
+    )
+    transferred_at = models.DateTimeField(null=True, blank=True)
+    transferred_by = models.ForeignKey(
+        "accounts.User",
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="+",
+    )
+    transfer_reason = models.CharField(
+        max_length=200,
+        blank=True,
+        help_text="Why it moved. Recorded because a transfer is a person's judgement, not a rule the system applied.",
+    )
+
     class Meta:
         ordering = ["-order_date", "-number"]
         indexes = [
@@ -151,14 +212,43 @@ class SchoolOrder(models.Model):
 
     @property
     def warehouse(self):
-        """Which warehouse fills this — the school's own, and only its own.
+        """Which warehouse fills this.
 
-        A school orders from one warehouse and no other. A *backorder* may
-        later be filled by a different warehouse shipping direct to the
-        school (decision D2), but that is a fulfilment decision made after
-        the fact, not something the school chooses here.
+        The school's own, until somebody transfers the order to one that has
+        the stock — p.8's "option to transfer an order to another warehouse
+        with Inventory", and decision D2.
+
+        The two halves of D2 stay separate here. **Ordering** is fixed:
+        `school.primary_warehouse` never changes, and a school still places
+        orders on one warehouse and no other. **Fulfilment** is what moves,
+        and it moves by setting `fulfilled_by_warehouse`.
+
+        Everything downstream — picking, availability, pick lists, shipping —
+        reads this property rather than the school's warehouse, so a transfer
+        redirects all of them at once.
         """
-        return self.school.primary_warehouse
+        return self.fulfilled_by_warehouse or self.school.primary_warehouse
+
+    @property
+    def was_transferred(self):
+        """True when another warehouse took this on."""
+        return self.fulfilled_by_warehouse_id is not None
+
+    @property
+    def shipments(self):
+        """Every despatch carrying part of this order.
+
+        A property rather than a related manager since F42: a shipment is
+        addressed to a *school* and carries several orders, so the link runs
+        through the lines. Reads like the old related name on purpose —
+        `order.shipments.filter(...)` still means what it always did.
+
+        Distinct, because an order with three SKUs on one van must not count
+        that van three times.
+        """
+        from orders.models.shipments import Shipment
+
+        return Shipment.objects.filter(lines__order=self).distinct()
 
     @property
     def is_cancelled(self) -> bool:

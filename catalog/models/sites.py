@@ -15,14 +15,13 @@ class TailoringCenter(models.Model):
     name = models.CharField(max_length=120)
     address = models.TextField(blank=True)
 
-    # Same "Active Y/N" pattern as Garment, Sku and School. A Tailoring
-    # Center that stops taking production orders keeps its history — every
-    # past receipt and production order still points at it, and PROTECT
-    # would refuse a delete anyway — so deactivating is the supported way
-    # to retire one.
+    # Sites are deactivated, never deleted — the same rule accounts follow.
+    # Every transaction that happened here points at this row, so PROTECT
+    # refuses the delete; a closed site has to be able to say it is closed
+    # while its history stays readable.
     is_active = models.BooleanField(
         default=True,
-        help_text="Inactive tailoring centers stay in reports but cannot be assigned new production orders.",
+        help_text="A closed site stays in reports but takes no new work.",
     )
 
     class Meta:
@@ -48,17 +47,20 @@ class Warehouse(models.Model):
     name = models.CharField(max_length=120)
     address = models.TextField(blank=True)
 
+    # Sites are deactivated, never deleted — the same rule accounts follow.
+    # Every transaction that happened here points at this row, so `PROTECT`
+    # refuses the delete and a closed site has to be able to say it is closed
+    # while its history stays readable.
+    is_active = models.BooleanField(
+        default=True,
+        help_text="A closed site stays in reports but takes no new work.",
+    )
+
     # "Warehouses have a primary TC but can order on any TC" (p.4), so this is
     # a default for production orders, not a restriction. Nullable because a
     # warehouse may be set up before its Tailoring Center exists.
     primary_tailoring_center = models.ForeignKey(
         TailoringCenter, null=True, blank=True, on_delete=models.PROTECT
-    )
-
-    # Same "Active Y/N" pattern as everywhere else in this module.
-    is_active = models.BooleanField(
-        default=True,
-        help_text="Inactive warehouses stay in reports and past orders but cannot receive new stock.",
     )
 
     class Meta:
@@ -97,6 +99,15 @@ class School(models.Model):
     level = models.CharField(max_length=2, choices=Level.choices)
     address = models.TextField(blank=True)
 
+    # Sites are deactivated, never deleted — the same rule accounts follow.
+    # Every transaction that happened here points at this row, so PROTECT
+    # refuses the delete; a closed site has to be able to say it is closed
+    # while its history stays readable.
+    is_active = models.BooleanField(
+        default=True,
+        help_text="A closed site stays in reports but takes no new work.",
+    )
+
     # A school orders from this warehouse and no other. A backorder may still
     # be *filled* by a different warehouse shipping direct to the school; see
     # the decision log, which matters when shipments are modelled.
@@ -105,16 +116,6 @@ class School(models.Model):
     # the schools that order from it.
     primary_warehouse = models.ForeignKey(
         Warehouse, on_delete=models.PROTECT, related_name="schools"
-    )
-
-    # Same "Active Y/N" pattern as Garment and Sku. A school stops taking
-    # deliveries without erasing its order history — PROTECT on every FK
-    # pointing at it would refuse the delete anyway, so deactivating is the
-    # only real option, and now it is a supported one rather than an
-    # unsupported one somebody reaches for.
-    is_active = models.BooleanField(
-        default=True,
-        help_text="Inactive schools stay in reports and past orders but cannot be assigned new ones.",
     )
 
     class Meta:
