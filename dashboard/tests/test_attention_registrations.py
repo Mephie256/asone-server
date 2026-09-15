@@ -76,21 +76,28 @@ class PendingRegistrationsAreSurfaced(AttentionSetup):
             "3 people waiting for an account",
         )
 
-    def test_an_unverified_request_is_not_shown(self):
-        """A lead cannot approve a request whose address nobody has proved
-        they hold, so showing it would be work that cannot be done."""
+    def test_an_unverified_request_is_shown(self):
+        """Reversed 15 September 2026, with the email code itself.
+
+        This used to assert the opposite: a request nobody had verified was
+        hidden, on the reasoning that a lead could not act on an address
+        nobody had proved they hold. In practice it hid real requests — a
+        code in a spam folder left a request no lead could see and nobody
+        could resend — and the address is proved anyway at the next step,
+        when approval emails that account its own credentials.
+
+        See accounts.services.request_registration.
+        """
         self.request_account("grace@example.com", verified=False)
 
-        self.assertNotIn("registrations_pending", self.kinds(user=self.sharon))
-
-    def test_it_appears_once_they_enter_their_code(self):
-        request = self.request_account("grace@example.com", verified=False)
-        self.assertNotIn("registrations_pending", self.kinds(user=self.sharon))
-
-        request.verified_at = timezone.now()
-        request.save(update_fields=["verified_at"])
-
         self.assertIn("registrations_pending", self.kinds(user=self.sharon))
+
+    def test_verified_and_unverified_are_counted_alike(self):
+        self.request_account("grace@example.com", verified=False)
+        self.request_account("amina@example.com", verified=True)
+
+        row = self.row("registrations_pending", user=self.sharon)
+        self.assertEqual(row["count"], 2)
 
     def test_a_decided_request_drops_off(self):
         request = self.request_account("grace@example.com", verified=True)

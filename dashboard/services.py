@@ -269,10 +269,16 @@ def needs_attention(warehouse=None, user=None):
     # present work that cannot be done. It appears the moment they enter
     # their code.
     if user is not None and has_role(user, *ALL_SITE_ROLES):
-        pending = RegistrationRequest.objects.filter(
-            status=RegistrationRequest.Status.PENDING,
-            verified_at__isnull=False,
-        ).count()
+        # Every pending request, verified or not. Asking for access no longer
+        # emails a code (see accounts.services.request_registration), so
+        # filtering on `verified_at` here would hide every new request from
+        # the only people who can act on one.
+        waiting = list(
+            RegistrationRequest.objects.filter(
+                status=RegistrationRequest.Status.PENDING,
+            ).values_list("pk", flat=True)
+        )
+        pending = len(waiting)
         if pending:
             alerts.append(
                 {
@@ -284,6 +290,13 @@ def needs_attention(warehouse=None, user=None):
                         if pending != 1
                         else "1 person waiting for an account"
                     ),
+                    # Only when there is exactly one. The row links through to
+                    # whichever screen handles the kind, and for a single
+                    # request that can be the person's own review rather than
+                    # a list the reader then has to search. With several
+                    # waiting there is no one target, and the list is the
+                    # honest destination.
+                    **({"ref_id": waiting[0]} if pending == 1 else {}),
                 }
             )
 
