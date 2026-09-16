@@ -19,6 +19,9 @@ from rest_framework_simplejwt.token_blacklist.models import BlacklistedToken, Ou
 from rest_framework_simplejwt.tokens import RefreshToken
 
 from . import permissions as perms
+from django.db.models import F
+
+from .authentication import stamp_session_epoch
 from .models import EmailVerification, LoginAttempt, LoginChallenge
 
 User = get_user_model()
@@ -29,10 +32,59 @@ User = get_user_model()
 # ---------------------------------------------------------------------------
 
 
-def issue_tokens_for(user) -> dict:
-    """Mint a fresh access/refresh pair for ``user``."""
+@transaction.atomic
+def sign_in_tokens_for(user) -> dict:
+    """Mint a pair for somebody signing in, ending every session they had.
+
+    **One account, one session.** Signing in anywhere retires every refresh
+    token the account holds, so the device that was already signed in stops
+    working. Sign in again there and this one stops instead.
+
+    The rule exists because a shared password is invisible otherwise: two
+    people using one account look exactly like one person, and every
+    transaction in this system records who performed it. With this, sharing
+    is not subtle — the other person is thrown out mid-task and says so.
+
+    ## What "logged out" means in practice, and the gap you cannot close here
+
+    Refresh tokens are rows and are retired immediately. Access tokens are
+    **not** — they are signed, stateless, and nothing consults the database
+    when one is presented. So the other device keeps working until its
+    current access token expires, which is at most ACCESS_TOKEN_LIFETIME
+    (30 minutes), and is then refused when it tries to refresh.
+
+    Closing that last half hour needs a token version on the user checked by
+    a custom authentication class, which is a database read on every single
+    request forever. Not worth it for the risk this addresses: the point is
+    that sharing a password becomes obvious, and being thrown out half an
+    hour later is obvious.
+    """
+    revoke_all_refresh_tokens(user)
+
+    # F-expression rather than `user.session_epoch + 1`: two sign-ins racing
+    # would both read the same number and both write the same one, and the
+    # loser would keep a working session. The database does the addition.
+    bump_session_epoch(user)
+
     refresh = RefreshToken.for_user(user)
+    stamp_session_epoch(refresh, user)
     return {"refresh": str(refresh), "access": str(refresh.access_token)}
+
+
+def bump_session_epoch(user) -> None:
+    """Invalidate every token this account already holds, at once.
+
+    The counterpart to retiring refresh tokens. That stops a session
+    *renewing*; this stops it working. Called wherever sessions are supposed
+    to end — signing in elsewhere, signing out, a lead signing somebody out,
+    a password change, an administrator reset.
+
+    An F-expression rather than `user.session_epoch + 1`: two of these racing
+    would both read the same number and write the same one, and the loser
+    would keep a working session. The database does the addition.
+    """
+    User.objects.filter(pk=user.pk).update(session_epoch=F("session_epoch") + 1)
+    user.refresh_from_db(fields=["session_epoch"])
 
 
 def blacklist_refresh_token(raw_token: str) -> None:
@@ -84,8 +136,11 @@ def change_password(user, new_password: str) -> dict:
     user.must_change_password = False
     user.save(update_fields=["password", "must_change_password"])
 
-    revoke_all_refresh_tokens(user)
-    return issue_tokens_for(user)
+    # The same path a sign-in takes: sessions retired, epoch bumped, the new
+    # pair stamped with it. Changing a password should end every other session
+    # for the same reason signing in does, and a pair minted any other way
+    # would carry no epoch and sit outside the rule entirely.
+    return sign_in_tokens_for(user)
 
 
 # ---------------------------------------------------------------------------
@@ -444,7 +499,12 @@ def set_user_password(user, *, new_password=None, must_change_password=True) -> 
 
     # Whoever knew the old password — including whoever prompted the change —
     # must not keep a working session.
+    # Immediate, not "within thirty minutes" — see force_sign_out. An
+    # administrator resetting a password is usually doing it because the old
+    # one is compromised, so leaving the old sessions alive on their current
+    # access tokens defeats the point.
     revoke_all_refresh_tokens(user)
+    bump_session_epoch(user)
 
     return new_password
 
@@ -469,8 +529,19 @@ def force_sign_out(user) -> int:
     """Retire every session belonging to `user`, leaving the account usable.
 
     For a lost or stolen device, where the person still works here.
+
+    The epoch bump is what makes this immediate. Retiring refresh tokens alone
+    only stops the device *renewing* — it would carry on with the access token
+    already in its hand for up to thirty minutes, which is not what anybody
+    clicking "sign out everywhere" about a lost laptop expects. Bumping the
+    epoch means the very next request that laptop makes is refused.
+
+    Returns the number of refresh tokens retired. Zero is a real answer worth
+    showing: it means they were not signed in anywhere.
     """
-    return revoke_all_refresh_tokens(user)
+    retired = revoke_all_refresh_tokens(user)
+    bump_session_epoch(user)
+    return retired
 
 
 # ---------------------------------------------------------------------------
@@ -646,11 +717,24 @@ def user_with_access(email):
     the user list stops being a known quantity and the trade stops paying.
     """
     user = User.objects.filter(email__iexact=(email or "").strip()).first()
-    if user is None or not user.is_active:
+
+    if user is None:
         raise NoAccess(
             "You do not have access to this system. Ask AsOne Central Office "
             "to create an account for you."
         )
+
+    # A deactivated account is not the same as no account, and telling
+    # somebody who has worked here for a year to ask for an account to be
+    # created sends them to the wrong person with the wrong question. They
+    # need reactivating, not creating.
+    if not user.is_active:
+        raise NoAccess(
+            "This account has been deactivated, so it cannot sign in. Ask "
+            "AsOne Central Office to reactivate it — nothing you have done "
+            "is lost."
+        )
+
     return user
 
 
